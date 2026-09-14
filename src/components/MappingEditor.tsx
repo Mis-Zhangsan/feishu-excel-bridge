@@ -1,5 +1,5 @@
-import { Fragment, useEffect, useLayoutEffect, useRef, useState } from 'react'
-import { FT, IMPORTABLE_TYPES, fieldTypeLabel, fieldTypeTone } from '../lib/field-meta'
+import { Fragment, useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
+import { FT, IMPORTABLE_TYPES, fieldTypeLabel, fieldTypeTone, matchFieldsByName } from '../lib/field-meta'
 import type { FieldBrief, SourceColumn, SourceSheet, TableBrief } from '../lib/types'
 import { IconImage, IconLink, IconTable } from './icons'
 import { Popover, Tip } from './ui'
@@ -13,12 +13,6 @@ type Props = {
 
 function cloneSheets(sheets: SourceSheet[]): SourceSheet[] {
   return sheets.map((s) => ({ ...s, columns: s.columns.map((c) => ({ ...c })) }))
-}
-
-/** 映射到已有字段时，色块跟着目标字段的真实类型走 */
-function mappedTypeOf(col: SourceColumn, fields: FieldBrief[]): number {
-  const hit = fields.find((f) => f.id === col.targetFieldId)
-  return hit ? hit.type : col.targetFieldType
 }
 
 /**
@@ -92,11 +86,49 @@ export default function MappingEditor({ sheets, tables, onChange, onLoadFields }
     }
   }, [sheets, fieldCache, onLoadFields])
 
-  const mutate = (fn: (draft: SourceSheet[]) => void) => {
-    const draft = cloneSheets(sheets)
-    fn(draft)
-    onChange(draft)
-  }
+  const mutate = useCallback(
+    (fn: (draft: SourceSheet[]) => void) => {
+      const draft = cloneSheets(sheets)
+      fn(draft)
+      onChange(draft)
+    },
+    [sheets, onChange],
+  )
+
+  /*
+   * 合并到已有表时，按**字段名自动匹配**。
+   *
+   * 规则（与「写入新表」共用同一套字段行，但语义不同）：
+   *   A 合并进 B，A 的「甲/乙/丙」自动写进 B 的同名字段；
+   *   B 里没有的（如「丁」）保持未绑定 —— 用户勾选即新增该列，取消勾选即不导入。
+   *
+   * 用户手动调过的列（mappingTouched）不参与，否则刚解绑就又被自动绑回去。
+   * 只在「确实有列能匹配上」时才改数据，避免 onChange 触发无限循环。
+   */
+  useEffect(() => {
+    for (const s of sheets) {
+      if (s.importMode !== 'append' || !s.importTableId) continue
+      const list = fieldCache[s.importTableId]
+      if (!list) continue
+      const hits = matchFieldsByName(s.columns, list)
+      // 只在「确实有列能匹配上且还没绑」时才改数据，避免 onChange 触发无限循环
+      const need = hits.some((h, i) => !!h && !s.columns[i].targetFieldId)
+      if (!need) continue
+      mutate((draft) => {
+        const sheet = draft.find((x) => x.name === s.name)
+        if (!sheet) return
+        const mapped = matchFieldsByName(sheet.columns, list)
+        sheet.columns.forEach((col, i) => {
+          if (col.targetFieldId) return
+          const hit = mapped[i]
+          if (!hit) return
+          col.targetFieldId = hit.id
+          col.targetFieldName = hit.name
+          col.targetFieldType = hit.type
+        })
+      })
+    }
+  }, [sheets, fieldCache, mutate])
 
   const updateColumn = (sheetName: string, colKey: string, patch: Partial<SourceColumn>) => {
     mutate((draft) => {
@@ -120,6 +152,16 @@ export default function MappingEditor({ sheets, tables, onChange, onLoadFields }
         /** 本表是否全选 / 部分选中（表头的三态勾选框要用） */
         const allOn = sheet.columns.length > 0 && enabledCount === sheet.columns.length
         const someOn = enabledCount > 0 && !allOn
+        /*
+         * 合并到已有表时，先把「自动匹配」的结果汇总出来 ——
+         * 用户最关心的就是「哪些字段接上了、哪些会新建」，不必逐行去看。
+         */
+        const matchedCount = appendMode
+          ? sheet.columns.filter((c) => c.enabled && c.targetFieldId).length
+          : 0
+        const newCount = appendMode
+          ? sheet.columns.filter((c) => c.enabled && !c.targetFieldId).length
+          : 0
 
         return (
           <div className="sheet-block" key={`sheet-${si}`}>
@@ -142,6 +184,14 @@ export default function MappingEditor({ sheets, tables, onChange, onLoadFields }
                 {sheet.totalDataRows} 行 · {enabledCount}/{sheet.columns.length} 列
               </span>
 
+              {/* 合并模式下把「匹配 / 新增」的结论摆出来，不用逐行看 */}
+              {appendMode && (matchedCount > 0 || newCount > 0) && (
+                <span className="sheet-merge-stat" title="按字段名自动匹配的结果">
+                  {matchedCount > 0 && <span className="ms-item ms-ok">✓ {matchedCount} 个接上</span>}
+                  {newCount > 0 && <span className="ms-item ms-new">＋ {newCount} 个新增</span>}
+                </span>
+              )}
+
               <div className="dest-combo">
                 <select
                   className="dest-select"
@@ -155,11 +205,18 @@ export default function MappingEditor({ sheets, tables, onChange, onLoadFields }
                       if (v === '__new__') {
                         s.importMode = 'create'
                         s.importTableId = ''
+                        // 回到「新建表」模式：清掉绑定，所有字段都变成"将新建"
+                        s.columns.forEach((c) => {
+                          c.targetFieldId = ''
+                          c.mappingTouched = false
+                        })
                       } else {
                         s.importMode = 'append'
                         s.importTableId = v
+                        // 换了目标表：清空绑定并允许重新自动匹配
                         s.columns.forEach((c) => {
                           c.targetFieldId = ''
+                          c.mappingTouched = false
                         })
                       }
                     })
@@ -214,7 +271,8 @@ export default function MappingEditor({ sheets, tables, onChange, onLoadFields }
                   <span>字段名</span>
                   <span className="mh-count">非空</span>
                   <span />
-                  <span>字段类型</span>
+                  {/* 两套逻辑的语义不同：新建表时选类型；合并到已有表时看"写进哪个字段" */}
+                  <span>{appendMode ? '写入到' : '字段类型'}</span>
                 </div>
                 <div className="map-rows">
                 {sheet.columns.length === 0 && <div className="empty sm">该工作表没有可导入的列</div>}
@@ -277,102 +335,132 @@ export default function MappingEditor({ sheets, tables, onChange, onLoadFields }
                       →
                     </span>
 
-                    {/* 字段类型：胶囊即按钮，点开弹层换类型 */}
+                    {/*
+                      右侧有两种语义 —— 这是「写入新表」与「合并到已有表」的关键差异：
+                        · 新建数据表：这里选**字段类型**（所有字段都是新建的）
+                        · 合并到已有表：这里显示**写进哪个字段**
+                            已按名匹配上 → 显示目标字段名（绿）
+                            目标表里没有 → 显示「+ 新增…」（会为新字段建列）
+                      两种情况下点开都是同一个弹层，可以随时改。
+                    */}
                     <div className="map-type">
-                      {col.targetFieldId ? (
-                        /* 已映射到已有字段：类型由目标字段决定，不可改 */
-                        <Tip text={`已映射到已有字段「${col.targetFieldName}」，类型由目标字段决定（${fieldTypeLabel(mappedTypeOf(col, fields))}）`}>
-                          <span className={`tk tk-${fieldTypeTone(mappedTypeOf(col, fields))} tk-static`}>
-                            <i className="tk-dot" />
-                            <span className="tk-text">{fieldTypeLabel(mappedTypeOf(col, fields))}</span>
-                            <IconLink size={11} />
-                          </span>
-                        </Tip>
-                      ) : (
-                        <Popover
-                          ariaLabel="选择字段类型"
-                          trigger={({ open, toggle }) => (
+                      <Popover
+                        ariaLabel={appendMode ? '选择写入的目标字段' : '选择字段类型'}
+                        trigger={({ open, toggle }) => {
+                          if (!appendMode) {
+                            return (
+                              <button
+                                type="button"
+                                className={`tk tk-${fieldTypeTone(col.targetFieldType)} tk-btn${open ? ' open' : ''}`}
+                                title={`导入后的字段类型：${fieldTypeLabel(col.targetFieldType)}，点击更换`}
+                                aria-haspopup="dialog"
+                                aria-expanded={open}
+                                onClick={toggle}
+                              >
+                                <i className="tk-dot" />
+                                <span className="tk-text">{fieldTypeLabel(col.targetFieldType)}</span>
+                                <span className="tk-caret" aria-hidden />
+                              </button>
+                            )
+                          }
+                          // 合并模式：把匹配结果显示出来
+                          return col.targetFieldId ? (
                             <button
                               type="button"
-                              className={`tk tk-${fieldTypeTone(col.targetFieldType)} tk-btn${open ? ' open' : ''}`}
-                              title={`导入后的字段类型：${fieldTypeLabel(col.targetFieldType)}，点击更换`}
+                              className={`tk tk-matched tk-btn${open ? ' open' : ''}`}
+                              title={`已按字段名匹配到「${col.targetFieldName}」（${fieldTypeLabel(col.targetFieldType)}），点击更改`}
                               aria-haspopup="dialog"
                               aria-expanded={open}
                               onClick={toggle}
                             >
-                              <i className="tk-dot" />
-                              <span className="tk-text">{fieldTypeLabel(col.targetFieldType)}</span>
+                              <IconLink size={11} />
+                              <span className="tk-text">{col.targetFieldName}</span>
                               <span className="tk-caret" aria-hidden />
                             </button>
-                          )}
-                        >
-                          {({ close }) => (
-                            <span className="tk-menu" role="listbox">
-                              {appendMode && fields.length > 0 && (
-                                <>
-                                  <span className="tk-sec">
-                                    <IconTable size={11} />
-                                    映射到已有字段
-                                  </span>
-                                  <span className="tk-target">
-                                    <select
-                                      className="input"
-                                      value={col.targetFieldId}
-                                      onChange={(e) => {
-                                        const v = e.target.value
-                                        if (!v) {
-                                          updateColumn(sheet.name, col.key, {
-                                            targetFieldId: '',
-                                            targetFieldName: col.header,
-                                          })
-                                          return
-                                        }
-                                        const meta = fields.find((f) => f.id === v)
+                          ) : (
+                            <button
+                              type="button"
+                              className={`tk tk-newfield tk-btn${open ? ' open' : ''}`}
+                              title={`目标表里没有「${col.header}」，导入时会新增该字段（${fieldTypeLabel(col.targetFieldType)}）；不想新增就取消左侧勾选`}
+                              aria-haspopup="dialog"
+                              aria-expanded={open}
+                              onClick={toggle}
+                            >
+                              <span className="tk-text">＋ 新增「{col.header}」</span>
+                              <span className="tk-caret" aria-hidden />
+                            </button>
+                          )
+                        }}
+                      >
+                        {({ close }) => (
+                          <span className="tk-menu" role="listbox">
+                            {appendMode && fields.length > 0 && (
+                              <>
+                                <span className="tk-sec">
+                                  <IconTable size={11} />
+                                  写入到
+                                </span>
+                                <span className="tk-target">
+                                  <select
+                                    className="input"
+                                    value={col.targetFieldId}
+                                    onChange={(e) => {
+                                      const v = e.target.value
+                                      // 用户手动指定过 → 之后不再自动匹配
+                                      if (!v) {
                                         updateColumn(sheet.name, col.key, {
-                                          targetFieldId: v,
-                                          targetFieldName: meta?.name ?? col.targetFieldName,
-                                          targetFieldType: meta ? meta.type : col.targetFieldType,
+                                          targetFieldId: '',
+                                          targetFieldName: col.header,
+                                          mappingTouched: true,
                                         })
-                                      }}
-                                    >
-                                      <option value="">不映射（新建字段）</option>
-                                      {fields.map((f) => (
-                                        <option key={f.id} value={f.id}>
-                                          {f.name}（{fieldTypeLabel(f.type)}）
-                                        </option>
-                                      ))}
-                                    </select>
-                                  </span>
-                                  <span className="tk-sec">或新建为</span>
-                                </>
-                              )}
-                              {IMPORTABLE_TYPES.map((t) => (
-                                <button
-                                  key={t.value}
-                                  type="button"
-                                  role="option"
-                                  aria-selected={t.value === col.targetFieldType}
-                                  className={`tk-item${t.value === col.targetFieldType ? ' on' : ''}`}
-                                  onClick={() => {
-                                    updateColumn(sheet.name, col.key, {
-                                      targetFieldType: t.value,
-                                      inferredType: t.value,
-                                      typeTouched: true,
-                                    })
-                                    close()
-                                  }}
-                                >
-                                  <span className={`tk tk-${fieldTypeTone(t.value)}`}>
-                                    <i className="tk-dot" />
-                                    {t.label}
-                                  </span>
-                                  {t.value === col.targetFieldType && <span className="tk-check">✓</span>}
-                                </button>
-                              ))}
-                            </span>
-                          )}
-                        </Popover>
-                      )}
+                                        return
+                                      }
+                                      const meta = fields.find((f) => f.id === v)
+                                      updateColumn(sheet.name, col.key, {
+                                        targetFieldId: v,
+                                        targetFieldName: meta?.name ?? col.targetFieldName,
+                                        targetFieldType: meta ? meta.type : col.targetFieldType,
+                                        mappingTouched: true,
+                                      })
+                                    }}
+                                  >
+                                    <option value="">＋ 新建字段「{col.header}」</option>
+                                    {fields.map((f) => (
+                                      <option key={f.id} value={f.id}>
+                                        {f.name}（{fieldTypeLabel(f.type)}）
+                                      </option>
+                                    ))}
+                                  </select>
+                                </span>
+                                <span className="tk-sec">新字段的类型</span>
+                              </>
+                            )}
+                            {IMPORTABLE_TYPES.map((t) => (
+                              <button
+                                key={t.value}
+                                type="button"
+                                role="option"
+                                aria-selected={t.value === col.targetFieldType}
+                                className={`tk-item${t.value === col.targetFieldType ? ' on' : ''}`}
+                                onClick={() => {
+                                  updateColumn(sheet.name, col.key, {
+                                    targetFieldType: t.value,
+                                    inferredType: t.value,
+                                    typeTouched: true,
+                                  })
+                                  close()
+                                }}
+                              >
+                                <span className={`tk tk-${fieldTypeTone(t.value)}`}>
+                                  <i className="tk-dot" />
+                                  {t.label}
+                                </span>
+                                {t.value === col.targetFieldType && <span className="tk-check">✓</span>}
+                              </button>
+                            ))}
+                          </span>
+                        )}
+                      </Popover>
                       {col.targetFieldType === FT.Attachment && !col.typeTouched && col.mediaCount === 0 && (
                         <Tip text="该列被识别为附件字段，但没有检测到图片，导入后会得到空附件。">
                           <span className="dot warn" />

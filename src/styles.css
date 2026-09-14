@@ -1322,6 +1322,31 @@ select.input {
   flex-wrap: wrap;
 }
 
+/* 合并模式下的「匹配 / 新增」汇总 */
+.sheet-merge-stat {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  flex: none;
+  font-size: 10.5px;
+}
+
+.sheet-merge-stat .ms-item {
+  padding: 1px 7px;
+  border-radius: 999px;
+  white-space: nowrap;
+}
+
+.sheet-merge-stat .ms-ok {
+  background: #d1fae5;
+  color: #047857;
+}
+
+.sheet-merge-stat .ms-new {
+  background: var(--accent-softer);
+  color: var(--accent-ink);
+}
+
 /*
  * 目标表：下拉 + 名称合成一个控件。
  * 选「新建数据表」时右侧直接就是可编辑的名称 ——
@@ -1709,6 +1734,21 @@ select.input {
 .tk-other {
   background: #f1f5f9;
   color: var(--text-3);
+}
+
+/* ---- 合并到已有表时的两种状态 ---- */
+
+/* 已按字段名匹配到目标字段 */
+.tk-matched {
+  background: #d1fae5;
+  color: #047857;
+}
+
+/* 目标表里没有这个字段 —— 导入时会新增（虚线边框表示"待创建"） */
+.tk-newfield {
+  background: var(--accent-softer);
+  color: var(--accent-ink);
+  border: 1px dashed var(--accent-line);
 }
 
 /* ---------------- 类型胶囊：可点击按钮 + 展开菜单（tk-btn / tk-menu） ---------------- */

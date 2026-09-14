@@ -49,6 +49,11 @@ export type SourceColumn = {
   targetFieldType: number
   /** 用户在界面上手改过类型后置 true，后续不再被自动推断覆盖 */
   typeTouched: boolean
+  /**
+   * 用户手动调整过「写入到哪个字段」后置 true。
+   * 置位后不再参与自动按名匹配 —— 否则用户刚手动解绑，下一轮又被自动绑回去。
+   */
+  mappingTouched?: boolean
 }
 
 export type SourceSheet = {

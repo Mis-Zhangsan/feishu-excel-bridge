@@ -451,6 +451,47 @@ async function main() {
   ok(/tk-multi/.test(tones), '多选用独立色相 .tk-multi（不再与单选共用）')
   ok(!/tk-select/.test(tones), '旧的一体式 .tk-select 已不再输出')
 
+  /* ---- 合并到已有表的渲染：表头换成「写入到」+ 两种匹配状态 ---- */
+  /* 注意：这里会重渲染并覆盖 host，所以放在本节所有依赖上面 DOM 的断言之后 */
+  const mergeSheet = {
+    ...sheetFixture,
+    importMode: 'append' as const,
+    importTableId: 'tbl_merge',
+    columns: [
+      // 已按名匹配上
+      { ...col(0, '甲', true), targetFieldId: 'f_a', targetFieldName: '甲', targetFieldType: 1 },
+      // 目标表里没有 → 将新增
+      col(1, '丁', true),
+    ],
+  }
+  await act(async () => {
+    root.render(
+      createElement(MappingEditor, {
+        sheets: [mergeSheet],
+        tables: [{ id: 'tbl_merge', name: '目标表' }],
+        onChange: () => {},
+        onLoadFields: async () => [
+          { id: 'f_a', name: '甲', type: 1 },
+          { id: 'f_b', name: '乙', type: 2 },
+        ],
+      }),
+    )
+  })
+  const mergeHead = host.querySelector('.map-head')?.textContent ?? ''
+  ok(/写入到/.test(mergeHead), '合并模式表头改成「写入到」', { head: mergeHead })
+  ok(!/字段类型/.test(mergeHead), '合并模式表头不再写「字段类型」')
+  ok(!!host.querySelector('.tk-matched'), '已匹配的字段显示 .tk-matched')
+  ok(!!host.querySelector('.tk-newfield'), '目标表里没有的字段显示 .tk-newfield（将新增）')
+  const mergeStat = host.querySelector('.sheet-merge-stat')?.textContent ?? ''
+  ok(/接上/.test(mergeStat) && /新增/.test(mergeStat), '工作表头部汇总「N 个接上 / N 个新增」', {
+    stat: mergeStat,
+  })
+  // 自动匹配：列「甲」本来没绑定，onLoadFields 返回了同名字段 → 被自动接上
+  ok(
+    /写入到/.test(mergeHead) && !!host.querySelector('.tk-matched'),
+    '追加模式下按字段名自动接上（无需手动选）',
+  )
+
   /* ============ 9. 附件上传：超时保护与逐个兜底 ============ */
   console.log('\n=== 9. 附件上传的容错 ===')
   const { uploadFilesSerial } = await import('../src/lib/base-api')
@@ -539,6 +580,46 @@ async function main() {
    * 后者复用前者的 token → 单元格里填进错误的图、原图丢失。
    * 宁可多传几次，也不能冒填错图的风险。
    */
+
+  /* ---- 合并到已有表：按字段名自动匹配 ---- */
+  /*
+   * 规则：A 合并进 B，A 的「甲/乙/丙」自动接上 B 的同名字段；
+   * B 里没有的「丁」不匹配 —— 用户勾选即在 B 新增该列并写入。
+   */
+  const { matchFieldsByName } = await import('../src/lib/field-meta')
+  const targetFields = [
+    { id: 'f_a', name: '甲', type: 1 },
+    { id: 'f_b', name: '乙', type: 2 },
+    { id: 'f_c', name: '丙', type: 5 },
+    { id: 'f_e', name: '戊', type: 1 },
+    { id: 'f_f', name: '己', type: 1 },
+  ]
+  const srcCols = [
+    { header: '甲' },
+    { header: '乙' },
+    { header: '丙' },
+    { header: '丁' }, // B 里没有
+  ]
+  const hits = matchFieldsByName(srcCols, targetFields)
+  ok(hits.length === srcCols.length, '匹配结果与源列一一对应', { n: hits.length })
+  ok(
+    hits[0]?.id === 'f_a' && hits[1]?.id === 'f_b' && hits[2]?.id === 'f_c',
+    '甲/乙/丙 自动接上 B 的同名字段',
+    { got: hits.map((h) => h?.id ?? null).join(',') },
+  )
+  ok(hits[3] === null, 'B 里没有「丁」→ 不匹配（勾选则在 B 新增该列）')
+  ok(
+    matchFieldsByName([{ header: '  甲  ' }], targetFields)[0]?.id === 'f_a',
+    '字段名首尾空格被忽略',
+  )
+  ok(
+    matchFieldsByName([{ header: '甲甲' }], targetFields)[0] === null,
+    '不做模糊匹配（宁可漏配让人工确认，也不错配）',
+  )
+  ok(
+    matchFieldsByName([{ header: '甲', mappingTouched: true }], targetFields)[0] === null,
+    '用户手动调过的列不再被自动匹配覆盖',
+  )
 
   /* ============ 10. 导出：失败项可重试 / 可跳过 ============ */
   console.log('\n=== 10. 导出流程的失败处理 ===')

@@ -123,8 +123,28 @@ export const IMPORTABLE_TYPES: { value: number; label: string }[] = [
   { value: FT.Attachment, label: '附件' },
 ]
 
-/** 这些字段类型不支持写入（自动编号 / 公式 / 关联 / 查找等等） */
-export const READONLY_TYPES = new Set<number>([
+/**
+ * 合并到已有表时，按字段名把源列匹配到目标字段。
+ *
+ * 规则：源表 A 合并进目标表 B，A 的「甲/乙/丙」自动接上 B 的同名字段；
+ * B 里没有的（如「丁」）返回 null —— 由调用方决定是新增还是跳过，
+ * 界面上则表现为「＋ 新增「丁」」，用户取消勾选即可不导入。
+ *
+ * 两条刻意的约束：
+ * - 用户手动调过的列（mappingTouched）不参与匹配，否则他刚解绑就又被绑回去；
+ * - 名字比较用 trim 后的**全等**，不做模糊/相似匹配 ——
+ *   宁可漏配让人工确认，也不要错配把数据写进不相干的字段。
+ */
+export function matchFieldsByName<F extends { name: string }>(
+  columns: { header: string; mappingTouched?: boolean }[],
+  fields: F[],
+): (F | null)[] {
+  const byName = new Map<string, F>()
+  for (const f of fields) byName.set(f.name, f)
+  return columns.map((c) => (c.mappingTouched ? null : (byName.get(c.header.trim()) ?? null)))
+}
+
+/** 这些字段类型不支持写入（自动编号 / 公式 / 关联 / 查找等等） */export const READONLY_TYPES = new Set<number>([
   FT.SingleLink,
   FT.Lookup,
   FT.Formula,
