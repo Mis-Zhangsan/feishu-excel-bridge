@@ -1,4 +1,4 @@
-import { FT, READONLY_TYPES, fieldTypeLabel } from './field-meta'
+import { FT, READONLY_TYPES, fieldTypeLabel, isOptionNameSafe, OPTION_NAME_MAX_LEN } from './field-meta'
 import {
   addField,
   addRecords,
@@ -362,6 +362,16 @@ export async function runImport(sheets: SourceSheet[], opts: ImportOptions): Pro
           resolved.push({ column: col, fieldId: meta.id, type: meta.type, name: meta.name, isNew: false })
           reusedFields++
           if (meta.type === FT.SingleSelect || meta.type === FT.MultiSelect) {
+            // 目标字段是单选/多选：值不适合做选项时，写进去会变成空白，必须提前告知
+            const vals = collectSelectValues(sheet, col, meta.type)
+            const badCount = vals.filter((v) => !isOptionNameSafe(v)).length
+            if (badCount > 0) {
+              warnings.push(
+                `「${sheet.name}」的字段「${col.header}」有 ${badCount} 个值含换行或超过 ${OPTION_NAME_MAX_LEN} 字，` +
+                  `而目标字段「${meta.name}」是${fieldTypeLabel(meta.type)} —— 这些值可能显示为空。` +
+                  `建议先把目标字段改成「多行文本」再重新导入。`,
+              )
+            }
             let map = optionMaps.get(meta.id)
             if (!map) {
               map = await readOptionMap(table, meta.id)
@@ -400,6 +410,15 @@ export async function runImport(sheets: SourceSheet[], opts: ImportOptions): Pro
         resolved.push({ column: col, fieldId: sameName.id, type: sameName.type, name: sameName.name, isNew: false })
         reusedFields++
         if (sameName.type === FT.SingleSelect || sameName.type === FT.MultiSelect) {
+          const vals = collectSelectValues(sheet, col, sameName.type)
+          const badCount = vals.filter((v) => !isOptionNameSafe(v)).length
+          if (badCount > 0) {
+            warnings.push(
+              `「${sheet.name}」的字段「${col.header}」有 ${badCount} 个值含换行或超过 ${OPTION_NAME_MAX_LEN} 字，` +
+                `而目标表里的同名字段是${fieldTypeLabel(sameName.type)} —— 这些值可能显示为空。` +
+                `建议先把该字段改成「多行文本」再重新导入。`,
+            )
+          }
           let map = optionMaps.get(sameName.id)
           if (!map) {
             map = await readOptionMap(table, sameName.id)
@@ -411,9 +430,35 @@ export async function runImport(sheets: SourceSheet[], opts: ImportOptions): Pro
 
       // c) 新建（优先征用新建表自动生成的空白列）
       let effectiveType = wantType
+
+      /*
+       * ⚠️ 单选 / 多选的前置闸门。
+       *
+       * 飞书写单选单元格必须带选项 id；选项得先 addOption 建出来。
+       * 如果值含换行或超长，addOption 会失败 —— 而失败被吞掉后，
+       * 写单元格只能退回纯文本，接口不报错但**单元格是空的**，
+       * 用户看到的就是「这列数据丢了」。
+       *
+       * 所以先检查整列的值：只要有不适合做选项名的，这一列一律用「多行文本」，
+       * 完整保留原文。宁可少个下拉框，也不能让内容消失。
+       */
+      if (effectiveType === FT.SingleSelect || effectiveType === FT.MultiSelect) {
+        const vals = collectSelectValues(sheet, col, effectiveType)
+        const badCount = vals.filter((v) => !isOptionNameSafe(v)).length
+        if (badCount > 0) {
+          effectiveType = FT.Text
+          warnings.push(
+            `「${sheet.name}」的字段「${col.header}」有 ${badCount} 个值含换行或超过 ${OPTION_NAME_MAX_LEN} 字，` +
+              `不适合作为选项（飞书建选项会失败，且失败后单元格会静默变空）。已改用「多行文本」完整保留内容。`,
+          )
+        }
+      }
       let fieldId = ''
       try {
-        fieldId = await adoptSpare(wantName, wantType, col)
+        // ⚠️ 必须传 effectiveType —— 它可能已被上面的单选闸门降级为 Text。
+        // 早前这里错传了 wantType，导致"说要降级、实际还是建了单选"，
+        // 而 resolved.type 却是 Text，写入时用纯文本写单选字段 → 单元格静默变空。
+        fieldId = await adoptSpare(wantName, effectiveType, col)
       } catch (e) {
         errors.push({
           sheet: sheet.name,
@@ -425,16 +470,18 @@ export async function runImport(sheets: SourceSheet[], opts: ImportOptions): Pro
       }
       if (fieldId) continue
 
+      /** 记下真正尝试创建的类型，降级提示里要用 */
+      const attemptedType = effectiveType
       try {
-        fieldId = await addField(table, wantName, wantType)
+        fieldId = await addField(table, wantName, effectiveType)
       } catch (e) {
         // 该字段类型在当前租户/表格里不受支持时，降级为多行文本，而不是整列丢失
-        if (wantType !== FT.Text) {
+        if (attemptedType !== FT.Text) {
           try {
             fieldId = await addField(table, wantName, FT.Text)
             effectiveType = FT.Text
             warnings.push(
-              `字段「${wantName}」以「${fieldTypeLabel(wantType)}」创建失败，已降级为多行文本：${String(
+              `字段「${wantName}」以「${fieldTypeLabel(attemptedType)}」创建失败，已降级为多行文本：${String(
                 (e as Error)?.message ?? e,
               )}`,
             )

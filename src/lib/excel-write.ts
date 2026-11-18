@@ -1,6 +1,6 @@
 import JSZip from 'jszip'
 import * as XLSX from 'xlsx'
-import { attr, basename, dirname, findAll, escapeRegExp, parseRelationships, resolveZipPath } from './xml'
+import { attr, basename, dirname, findAll, escapeRegExp, escapeXml, parseRelationships, resolveZipPath } from './xml'
 import { normalizeImageExt } from './field-meta'
 
 const EMU_PER_PX = 9525
@@ -295,7 +295,11 @@ function buildCellImagesXml(
       return (
         `<etc:cellImage><xdr:pic>` +
         `<xdr:nvPicPr>` +
-        `<xdr:cNvPr id="${i + 2}" name="${e.id}" descr="${e.name}"/>` +
+        /*
+         * 必须转义：附件名里出现 & " < 很常见（「R&D 照片.jpg」），
+         * 直接插进属性会产出非法 XML，Excel/WPS 打开就是「文件已损坏」。
+         */
+        `<xdr:cNvPr id="${i + 2}" name="${escapeXml(e.id)}" descr="${escapeXml(e.name)}"/>` +
         `<xdr:cNvPicPr><a:picLocks noChangeAspect="1"/></xdr:cNvPicPr>` +
         `</xdr:nvPicPr>` +
         `<xdr:blipFill><a:blip r:embed="${e.rid}"/><a:stretch><a:fillRect/></a:stretch></xdr:blipFill>` +

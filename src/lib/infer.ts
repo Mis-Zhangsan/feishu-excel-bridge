@@ -46,11 +46,27 @@ export function parseNumber(v: CellRaw): number | null {
   if (typeof v === 'boolean') return v ? 1 : 0
   const t = rawToText(v).trim()
   if (!t) return null
+
   const pct = PCT_RE.test(t)
-  const cleaned = t.replace(/[,\s¥$€£元万亿]/g, '')
+  /*
+   * 百分比必须先剥掉 `%` —— 否则 `Number("12.5%")` 得到 NaN，
+   * 整列百分比都会判成「不是合法数字」而被跳过（曾导致整列丢失）。
+   */
+  const body = pct ? t.slice(0, -1) : t
+
+  /*
+   * 万 / 亿是**乘数**，不是噪声。
+   * 早前直接把它们连同 % 一起 replace 掉，于是「12万元」被读成 12、「3万」读成 3 ——
+   * 数字看着没问题，实际差了一万倍，属于静默写错数。
+   */
+  const unitMatch = /([万亿])/.exec(body)
+  const unit = unitMatch ? (unitMatch[1] === '亿' ? 1e8 : 1e4) : 1
+
+  const cleaned = body.replace(/[,\s¥$€£元万亿]/g, '')
   const n = Number(cleaned)
   if (!Number.isFinite(n)) return null
-  return pct ? n / 100 : n
+  const scaled = n * unit
+  return pct ? scaled / 100 : scaled
 }
 
 /** Excel 序列号（1900 日期系统）转毫秒时间戳 */
@@ -90,7 +106,15 @@ export function parseBool(v: CellRaw): boolean {
   return t === 'true' || t === 'yes' || t === 'y' || t === '是' || t === '1' || t === '√' || t === '✓'
 }
 
-const MULTI_SPLIT_RE = /\s*[,，;；|、\/]\s*/
+/**
+ * 多选值的分隔符。
+ *
+ * ⚠️ 刻意**不含** `/` 和 `|`。这两个字符在真实数据里太常见且不是列表分隔：
+ *   `A/B测试` / `TCP/IP` / `N/A` / `2026/01/31` / `http://x.com/a/b`
+ * 都会被拆碎 —— 而且碎片还会被真的建成选项写进单元格，属于**静默写错数**。
+ * 只保留明确表示并列的标点。
+ */
+const MULTI_SPLIT_RE = /\s*[,，;；、]\s*/
 
 export function splitMulti(v: CellRaw): string[] {
   return rawToText(v)

@@ -124,6 +124,32 @@ export const IMPORTABLE_TYPES: { value: number; label: string }[] = [
 ]
 
 /**
+ * 飞书单选选项名的长度上限（保守取值，官方文档未明确给出统一数字）。
+ * 超过这个长度的值不要拿去建选项 —— 建不出来会被静默丢弃。
+ */
+export const OPTION_NAME_MAX_LEN = 100
+
+/**
+ * 这个值能不能作为单选/多选的选项名。
+ *
+ * ⚠️ 这是**数据安全**的一道闸门，不是格式洁癖。
+ *
+ * 飞书的单选字段写入时必须带选项 id；选项不存在时，`field.addOption()` 会失败，
+ * 而失败被吞掉之后，写单元格时只能退回纯文本 —— 接口**不报错**，但单元格是空的。
+ * 用户看到的现象就是「这列的数据丢了」。
+ *
+ * 所以建字段前先判断：**含换行/制表符、或超长的值，这一列不要用单选**，
+ * 直接用「多行文本」承载完整原文。宁可少一个下拉框，也不能让内容消失。
+ */
+export function isOptionNameSafe(v: string): boolean {
+  const t = v.trim()
+  if (!t) return false
+  if (t.length > OPTION_NAME_MAX_LEN) return false
+  if (/[\r\n\t]/.test(t)) return false
+  return true
+}
+
+/**
  * 合并到已有表时，按字段名把源列匹配到目标字段。
  *
  * 规则：源表 A 合并进目标表 B，A 的「甲/乙/丙」自动接上 B 的同名字段；

@@ -9,8 +9,8 @@ import * as XLSX from 'xlsx'
 import { buildXlsxBytes } from '../src/lib/excel-write'
 import type { OutSheet } from '../src/lib/excel-write'
 import { parseWorkbookFile, extractDispImgId } from '../src/lib/excel-read'
-import { excelSerialToMs, formatDate } from '../src/lib/infer'
-import { FT } from '../src/lib/field-meta'
+import { excelSerialToMs, formatDate, parseNumber, splitMulti } from '../src/lib/infer'
+import { FT, OPTION_NAME_MAX_LEN, isOptionNameSafe } from '../src/lib/field-meta'
 import { cellKey } from '../src/lib/types'
 import { toBitableValue } from '../src/lib/value-convert'
 
@@ -473,6 +473,54 @@ async function checkImageBytesPreserved() {
   }
 }
 
+/* ------------------------------------------------------------------ */
+/* 数值与拆分：防「静默写错数」                                        */
+/* ------------------------------------------------------------------ */
+
+function checkNumberAndSplit() {
+  console.log('\n=== 数值解析与多选拆分 ===')
+
+  // 百分比：早前 % 没被剥掉，Number("12.5%") = NaN，整列百分比被判成非法数字
+  ok(parseNumber('12.5%') === 0.125, '百分比 12.5% → 0.125', { got: parseNumber('12.5%') })
+  ok(parseNumber('-3%') === -0.03, '负百分比 -3% → -0.03', { got: parseNumber('-3%') })
+  ok(parseNumber('100%') === 1, '百分比 100% → 1', { got: parseNumber('100%') })
+
+  // 万/亿是乘数，不是噪声：早前被连同 % 一起删掉，"12万元" 被读成 12
+  ok(parseNumber('12万元') === 120000, '「12万元」→ 120000（不是 12）', {
+    got: parseNumber('12万元'),
+  })
+  ok(parseNumber('3万') === 30000, '「3万」→ 30000', { got: parseNumber('3万') })
+  ok(parseNumber('1.5亿') === 150000000, '「1.5亿」→ 150000000', { got: parseNumber('1.5亿') })
+
+  // 常规值不受影响
+  ok(parseNumber('1,234.5') === 1234.5, '千分位 1,234.5 → 1234.5', {
+    got: parseNumber('1,234.5'),
+  })
+  ok(parseNumber('¥ 88') === 88, '货币符号 ¥ 88 → 88', { got: parseNumber('¥ 88') })
+  ok(parseNumber('') === null, '空串 → null')
+
+  /*
+   * 多选拆分：斜杠和竖线**不是**列表分隔符。
+   * 真实数据里 A/B测试、TCP/IP、N/A、2026/01/31、URL 都含斜杠，
+   * 拆碎后会变成错误选项写进单元格。
+   */
+  ok(splitMulti('A/B测试').join('|') === 'A/B测试', '「A/B测试」不被斜杠拆开', {
+    got: splitMulti('A/B测试').join('|'),
+  })
+  ok(splitMulti('TCP/IP').join('|') === 'TCP/IP', '「TCP/IP」不被拆开')
+  ok(splitMulti('2026/01/31').join('|') === '2026/01/31', '日期不被拆开')
+  ok(splitMulti('甲、乙、丙').join('|') === '甲|乙|丙', '顿号仍然按列表拆', {
+    got: splitMulti('甲、乙、丙').join('|'),
+  })
+  ok(splitMulti('甲，乙;丙').join('|') === '甲|乙|丙', '逗号/分号仍然拆')
+
+  // 单选选项名闸门：含换行或超长的值不能拿去建选项
+  ok(isOptionNameSafe('包装') === true, '普通短文本可作为选项')
+  ok(isOptionNameSafe('1、培训人员\n2、检重称确认') === false, '含换行的值不能作为选项')
+  ok(isOptionNameSafe('x'.repeat(OPTION_NAME_MAX_LEN + 1)) === false, '超长值不能作为选项')
+  ok(isOptionNameSafe('x'.repeat(OPTION_NAME_MAX_LEN)) === true, '恰好上限长度仍可用')
+}
+
 async function main() {
   console.log('extractDispImgId 自检')
   ok(extractDispImgId('DISPIMG("ID_8805AC7ED61347F68868D9FEB2B1289C",1)') === 'ID_8805AC7ED61347F68868D9FEB2B1289C', '能解析 DISPIMG 的 ID')
@@ -489,6 +537,7 @@ async function main() {
   checkDateConversion()
   await checkDateCellRead()
   await checkImageBytesPreserved()
+  checkNumberAndSplit()
 
   console.log(`\n${failed === 0 ? '全部通过 ✅' : `失败 ${failed} 项 ❌`}`)
   process.exit(failed === 0 ? 0 : 1)

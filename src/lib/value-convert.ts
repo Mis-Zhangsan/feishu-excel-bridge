@@ -57,12 +57,34 @@ export function toBitableValue(type: number, raw: CellRaw, ctx: ConvertContext):
     case FT.SingleSelect: {
       const t = rawToText(raw).trim()
       if (!t) return { ok: false, reason: '空值' }
-      return { ok: true, value: selectValue(t, ctx.options) }
+      const val = selectValue(t, ctx.options)
+      /*
+       * 目标字段确实有选项列表、但没有这个值 —— 说明选项没建成功。
+       * 这时写纯文本不会报错，但单元格会**静默变空**，等于数据消失。
+       * 与其悄悄丢数据，不如显式报错，让用户在导入结果里看到是哪一行哪一列。
+       */
+      if (typeof val === 'string' && ctx.options && ctx.options.size > 0) {
+        const brief = t.length > 30 ? `${t.slice(0, 30)}…` : t
+        return { ok: false, reason: `单选选项里没有「${brief}」（选项未建成，写入会变成空白）` }
+      }
+      return { ok: true, value: val }
     }
 
     case FT.MultiSelect: {
       const arr = splitMulti(raw)
       if (!arr.length) return { ok: false, reason: '空值' }
+      // 同单选：选项不存在时写进去会被静默丢弃，这里显式报出来
+      if (ctx.options && ctx.options.size > 0) {
+        const missing = arr.filter((t) => !ctx.options!.has(t))
+        if (missing.length) {
+          const first = missing[0]
+          const brief = first.length > 30 ? `${first.slice(0, 30)}…` : first
+          return {
+            ok: false,
+            reason: `多选选项里没有「${brief}」${missing.length > 1 ? ` 等 ${missing.length} 个值` : ''}（写入会丢失）`,
+          }
+        }
+      }
       return { ok: true, value: arr.map((t) => selectValue(t, ctx.options)) }
     }
 
