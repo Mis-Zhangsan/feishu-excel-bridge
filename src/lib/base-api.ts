@@ -165,22 +165,33 @@ export async function preAddOptions(
   // 全都已存在：不必再建，也不必再回读一次
   if (!missing.length) return map
 
-  const CONCURRENCY = 4
-  for (let i = 0; i < missing.length; i += CONCURRENCY) {
-    const slice = missing.slice(i, i + CONCURRENCY)
-    await Promise.allSettled(
-      slice.map(async (v) => {
-        try {
-          await field.addOption(v)
-        } catch {
-          /* 选项已存在 / 非法值，忽略 */
-        }
-      }),
-    )
+  /*
+   * ⚠️ 必须**串行**，不能并发。
+   *
+   * 曾经为了提速改成每批 4 个并发 `field.addOption()`，结果同一字段上的
+   * 并发写入互相冲突，**几乎全部失败** —— 表现就是每一行都报
+   * 「单选选项里没有 X（选项未建成）」。飞书的 addOption 不是为并发设计的。
+   *
+   * 提速只能靠"先读已有、只补缺失"，而不是并发。
+   */
+  let firstError = ''
+  for (const v of missing) {
+    try {
+      await field.addOption(v)
+    } catch (e) {
+      // 不再完全静默：至少记下第一条，方便排查（选项已存在也会走到这里，属正常）
+      if (!firstError) firstError = String((e as Error)?.message ?? e)
+    }
+  }
+  if (firstError) {
+    console.warn(`[excel-bridge] 创建选项失败（字段 ${fieldId}，共 ${missing.length} 个待建）：${firstError}`)
   }
 
-  // 建完再回读一次，拿到真实的选项 id —— 写单元格必须用 id，用文本会被静默丢弃
-  return await readOptionMap(table, fieldId, map, field)
+  /*
+   * 建完**重新 getField** 再读，确保拿到最新选项列表。
+   * 这里刻意不复用上面的 field 对象 —— 多次 addOption 之后它可能是旧快照。
+   */
+  return await readOptionMap(table, fieldId, map)
 }
 
 /**

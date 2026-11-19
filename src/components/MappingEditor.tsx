@@ -401,36 +401,55 @@ export default function MappingEditor({ sheets, tables, onChange, onLoadFields }
                                   写入到
                                 </span>
                                 <span className="tk-target">
-                                  <select
-                                    className="input"
-                                    value={col.targetFieldId}
-                                    onChange={(e) => {
-                                      const v = e.target.value
-                                      // 用户手动指定过 → 之后不再自动匹配
-                                      if (!v) {
+                                  {/*
+                                   * 用自绘列表而不是 <select>：
+                                   * 原生下拉在飞书 iframe 里只能显示一两行，字段一多就没法选。
+                                   * 这里直接铺开成可滚动列表，当前项打勾高亮。
+                                   */}
+                                  <span className="tk-field-list" role="listbox" aria-label="写入到">
+                                    <button
+                                      type="button"
+                                      role="option"
+                                      aria-selected={!col.targetFieldId}
+                                      className={`tk-field-item${!col.targetFieldId ? ' on' : ''}`}
+                                      onClick={() => {
                                         updateColumn(sheet.name, col.key, {
                                           targetFieldId: '',
-                                          targetFieldName: col.header,
+                                          targetFieldName: col.targetFieldName || col.header,
                                           mappingTouched: true,
                                         })
-                                        return
-                                      }
-                                      const meta = fields.find((f) => f.id === v)
-                                      updateColumn(sheet.name, col.key, {
-                                        targetFieldId: v,
-                                        targetFieldName: meta?.name ?? col.targetFieldName,
-                                        targetFieldType: meta ? meta.type : col.targetFieldType,
-                                        mappingTouched: true,
-                                      })
-                                    }}
-                                  >
-                                    <option value="">＋ 新建字段「{col.header}」</option>
-                                    {fields.map((f) => (
-                                      <option key={f.id} value={f.id}>
-                                        {f.name}（{fieldTypeLabel(f.type)}）
-                                      </option>
-                                    ))}
-                                  </select>
+                                      }}
+                                    >
+                                      <span className="tk-field-name">
+                                        ＋ 新建字段「{col.targetFieldName || col.header}」
+                                      </span>
+                                      {!col.targetFieldId && <span className="tk-check">✓</span>}
+                                    </button>
+                                    {fields.map((f) => {
+                                      const on = col.targetFieldId === f.id
+                                      return (
+                                        <button
+                                          key={f.id}
+                                          type="button"
+                                          role="option"
+                                          aria-selected={on}
+                                          className={`tk-field-item${on ? ' on' : ''}`}
+                                          onClick={() => {
+                                            updateColumn(sheet.name, col.key, {
+                                              targetFieldId: f.id,
+                                              targetFieldName: f.name,
+                                              targetFieldType: f.type,
+                                              mappingTouched: true,
+                                            })
+                                          }}
+                                        >
+                                          <span className="tk-field-name">{f.name}</span>
+                                          <span className="tk-field-type">{fieldTypeLabel(f.type)}</span>
+                                          {on && <span className="tk-check">✓</span>}
+                                        </button>
+                                      )
+                                    })}
+                                  </span>
                                 </span>
 
                                 {/*

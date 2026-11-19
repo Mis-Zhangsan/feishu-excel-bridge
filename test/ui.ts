@@ -533,6 +533,17 @@ async function main() {
   ok(!/新字段类型/.test(popText), '已绑定已有字段时不显示「新字段类型」')
   ok(!/新字段名称/.test(popText), '已绑定已有字段时不显示「新字段名称」')
 
+  /*
+   * 字段选择改成自绘列表：原生 <select> 在飞书 iframe 里只能展开一两行，
+   * 字段一多根本没法选。列表要能滚动、当前项高亮并打勾。
+   */
+  ok(!!host.querySelector('.tk-field-list'), '字段选择是可滚动列表 .tk-field-list')
+  ok(!host.querySelector('.tk-target select'), '不再使用原生 select')
+  const fieldItems = host.querySelectorAll('.tk-field-item')
+  ok(fieldItems.length >= 2, '列表含「新建字段」+ 已有字段', { n: fieldItems.length })
+  ok(!!host.querySelector('.tk-field-item.on'), '当前选中项有高亮 .on')
+  ok(!!host.querySelector('.tk-field-item.on .tk-check'), '当前选中项打勾')
+
   /* ---- 紧凑时长格式 ---- */
   ok(formatDurationShort(0) === '0:00', 'formatDurationShort(0) → 0:00', {
     got: formatDurationShort(0),
