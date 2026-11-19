@@ -522,9 +522,14 @@ function checkNumberAndSplit() {
   })
   ok(splitMulti('甲，乙;丙').join('|') === '甲|乙|丙', '逗号/分号仍然拆')
 
-  // 单选选项名闸门：含换行或超长的值不能拿去建选项
+  // 单选选项名闸门：只拦超长
   ok(isOptionNameSafe('包装') === true, '普通短文本可作为选项')
-  ok(isOptionNameSafe('1、培训人员\n2、检重称确认') === false, '含换行的值不能作为选项')
+  /*
+   * 含换行**不再预判为非法** —— 实测有一部分能建成（如「泵头坏了，\n挤不出料体」）。
+   * 预判性过滤只会让这些值白白变成空白单元格；改为交给 addOption 去试，
+   * 真正建不成的再由调用方按行报出来。
+   */
+  ok(isOptionNameSafe('1、培训人员\n2、检重称确认') === true, '含换行的值也交给 SDK 尝试（不预判）')
   ok(isOptionNameSafe('x'.repeat(OPTION_NAME_MAX_LEN + 1)) === false, '超长值不能作为选项')
   ok(isOptionNameSafe('x'.repeat(OPTION_NAME_MAX_LEN)) === true, '恰好上限长度仍可用')
 

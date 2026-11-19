@@ -94,10 +94,27 @@ function detectSpareFields(fields: FieldBrief[]): FieldBrief[] {
   return fields.filter((f) => f.type === FT.Text && DEFAULT_NAMES.test((f.name || '').trim()))
 }
 
+/** 找出这些值在源表里出现的行号（用于"选项没建成"的定位） */
+function findRowsForValues(
+  sheet: SourceSheet,
+  col: SourceColumn,
+  values: string[],
+): { row: number; text: string }[] {
+  const wanted = new Set(values)
+  const out: { row: number; text: string }[] = []
+  for (const r of dataRowIndexes(sheet)) {
+    const t = rawToText(sheet.matrix[r]?.[col.col] ?? null).trim()
+    if (t && wanted.has(t)) out.push({ row: r + 1, text: t })
+  }
+  return out
+}
+
 /**
- * 找出这一列里**不适合作为选项名**的值，并带上 Excel 行号。
+ * 找出这一列里**明显不适合**作为选项名的值（目前只判超长），并带上 Excel 行号。
  *
- * 只说"有 3 个值有问题"用户没法核对；要能直接跳到那一行去改。
+ * 仅用于「新建字段」时决定该列用单选还是降级为文本。
+ * **不要在这里拦含换行的值** —— 实测有一部分能建成选项，预判会误伤。
+ *
  * 行号用 `r + 1`：matrix 是 0-based 且含表头，所以 +1 就是 Excel 里看到的行号。
  */
 function findUnsafeOptionValues(
@@ -410,6 +427,13 @@ export async function runImport(sheets: SourceSheet[], opts: ImportOptions): Pro
       return spare.id
     }
 
+    /*
+     * 阶段计时：追加模式比新建表慢很多，但光看总时长没法定位。
+     * 记录两个关键阶段的耗时，超过 3 秒的写进警告，用户复测时能直接看出来
+     * 是"字段/选项准备"慢还是"写记录"慢。
+     */
+    const tFieldsStart = Date.now()
+
     for (let ci = 0; ci < enabled.length; ci++) {
       const col = enabled[ci]
       /*
@@ -444,20 +468,25 @@ export async function runImport(sheets: SourceSheet[], opts: ImportOptions): Pro
              * 这正是「追加导入只写进去几条」的主要成因之一。
              */
             const vals = collectSelectValues(sheet, col, meta.type)
-            const safe = vals.filter((v) => isOptionNameSafe(v))
-            // 精确到行：只报数量用户没法核对，得能直接跳到那一行
-            const bad = findUnsafeOptionValues(sheet, col, meta.type)
-            if (bad.length > 0) {
-              warnings.push(
-                `「${sheet.name}」的字段「${col.header}」有 ${bad.length} 处值无法作为${fieldTypeLabel(meta.type)}选项` +
-                  `（含换行或超过 ${OPTION_NAME_MAX_LEN} 字）：${describeBadOptions(bad)}。` +
-                  `这些单元格会为空；建议把目标字段改成「多行文本」后重新导入。`,
-              )
-            }
             let map = optionMaps.get(meta.id)
             if (!map) {
-              map = await preAddOptions(table, meta.id, meta.type, safe)
-              optionMaps.set(meta.id, map)
+              /*
+               * 传**全部**值让 SDK 去试，不预先筛掉"看起来不能建"的。
+               * 之前用 isOptionNameSafe 预过滤，把含换行的值直接跳过了 ——
+               * 实测发现其中一部分其实能建成功，等于白白丢数据。
+               */
+              const created = await preAddOptions(table, meta.id, meta.type, vals)
+              optionMaps.set(meta.id, created)
+              map = created
+              // 事后检查：哪些**真的**没建成
+              const notCreated = vals.filter((v) => !created.has(v))
+              if (notCreated.length > 0) {
+                const rows = findRowsForValues(sheet, col, notCreated)
+                warnings.push(
+                  `「${sheet.name}」的字段「${col.header}」有 ${notCreated.length} 个值没能建成${fieldTypeLabel(meta.type)}选项：` +
+                    `${describeBadOptions(rows)}。这些单元格会为空。`,
+                )
+              }
             }
           }
           continue
@@ -492,21 +521,21 @@ export async function runImport(sheets: SourceSheet[], opts: ImportOptions): Pro
         resolved.push({ column: col, fieldId: sameName.id, type: sameName.type, name: sameName.name, isNew: false })
         reusedFields++
         if (sameName.type === FT.SingleSelect || sameName.type === FT.MultiSelect) {
-          // 同「手动映射」分支：追加时必须补建选项，否则新值全部写不进去
+          // 同「手动映射」分支：补建选项时传全部值，事后再看哪些真的没建成
           const vals = collectSelectValues(sheet, col, sameName.type)
-          const safe = vals.filter((v) => isOptionNameSafe(v))
-          const bad = findUnsafeOptionValues(sheet, col, sameName.type)
-          if (bad.length > 0) {
-            warnings.push(
-              `「${sheet.name}」的字段「${col.header}」有 ${bad.length} 处值无法作为${fieldTypeLabel(sameName.type)}选项` +
-                `（含换行或超过 ${OPTION_NAME_MAX_LEN} 字）：${describeBadOptions(bad)}。` +
-                `这些单元格会为空；建议把该字段改成「多行文本」后重新导入。`,
-            )
-          }
           let map = optionMaps.get(sameName.id)
           if (!map) {
-            map = await preAddOptions(table, sameName.id, sameName.type, safe)
-            optionMaps.set(sameName.id, map)
+            const created = await preAddOptions(table, sameName.id, sameName.type, vals)
+            optionMaps.set(sameName.id, created)
+            map = created
+            const notCreated = vals.filter((v) => !created.has(v))
+            if (notCreated.length > 0) {
+              const rows = findRowsForValues(sheet, col, notCreated)
+              warnings.push(
+                `「${sheet.name}」的字段「${col.header}」有 ${notCreated.length} 个值没能建成${fieldTypeLabel(sameName.type)}选项：` +
+                  `${describeBadOptions(rows)}。这些单元格会为空。`,
+              )
+            }
           }
         }
         continue
@@ -598,8 +627,18 @@ export async function runImport(sheets: SourceSheet[], opts: ImportOptions): Pro
         createdFields++
 
         if (effectiveType === FT.SingleSelect || effectiveType === FT.MultiSelect) {
-          const map = await preAddOptions(table, fieldId, effectiveType, collectSelectValues(sheet, col, effectiveType))
+          const vals = collectSelectValues(sheet, col, effectiveType)
+          const map = await preAddOptions(table, fieldId, effectiveType, vals)
           optionMaps.set(fieldId, map)
+          // 事后检查：新建字段也可能有个别值建不成选项
+          const notCreated = vals.filter((v) => !map.has(v))
+          if (notCreated.length > 0) {
+            const rows = findRowsForValues(sheet, col, notCreated)
+            warnings.push(
+              `「${sheet.name}」的字段「${col.header}」有 ${notCreated.length} 个值没能建成${fieldTypeLabel(effectiveType)}选项：` +
+                `${describeBadOptions(rows)}。这些单元格会为空；建议把该字段改成「多行文本」后重新导入。`,
+            )
+          }
         }
       } catch (e) {
         errors.push({
@@ -670,9 +709,20 @@ export async function runImport(sheets: SourceSheet[], opts: ImportOptions): Pro
     }
 
     /* --- 写回 --- */
+    const fieldsMs = Date.now() - tFieldsStart
     report('records', '正在写入记录', 0, records.length, `${sheet.name} · 共 ${records.length} 条记录`)
+    const tRecordsStart = Date.now()
     const addRes = await addRecords(table, records)
+    const recordsMs = Date.now() - tRecordsStart
     const written = addRes.written
+
+    // 超过 3 秒才提示，免得正常速度也被刷屏
+    const slowParts: string[] = []
+    if (fieldsMs > 3000) slowParts.push(`字段/选项准备 ${(fieldsMs / 1000).toFixed(1)}s`)
+    if (recordsMs > 3000) slowParts.push(`写入 ${records.length} 条记录 ${(recordsMs / 1000).toFixed(1)}s`)
+    if (slowParts.length) {
+      warnings.push(`「${sheet.name}」耗时较长的阶段：${slowParts.join('，')}。`)
+    }
 
     if (addRes.error) {
       /*

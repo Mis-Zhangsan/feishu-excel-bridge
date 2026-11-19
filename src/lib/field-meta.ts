@@ -144,9 +144,16 @@ export const OPTION_NAME_MAX_LEN = 100
 export function isOptionNameSafe(v: string): boolean {
   const t = v.trim()
   if (!t) return false
-  if (t.length > OPTION_NAME_MAX_LEN) return false
-  if (/[\r\n\t]/.test(t)) return false
-  return true
+  /*
+   * 只拦**超长**。
+   *
+   * 早前还拦了含换行的值，理由是"选项名不该有换行"。但那是**猜的** ——
+   * 实测中「薇诺娜50g清透防晒乳SPF48 PA+++\n（新包装）」「泵头坏了，\n挤不出料体」
+   * 这类值有一部分能成功建成选项。预判性过滤只会让它们白白变成空白单元格。
+   *
+   * 正确做法：**让 addOption 去试**，建不成的再由调用方按行报出来。
+   */
+  return t.length <= OPTION_NAME_MAX_LEN
 }
 
 /**

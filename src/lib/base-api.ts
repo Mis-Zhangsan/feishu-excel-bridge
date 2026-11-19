@@ -161,18 +161,24 @@ export async function preAddOptions(
   if (typeof field?.addOption !== 'function') return map
 
   const wanted = values.slice(0, 200)
+  /*
+   * ⚠️ 这里**不做预过滤**。
+   *
+   * 早前用 isOptionNameSafe 先把"含换行/超长"的值筛掉，理由是"肯定建不出来"。
+   * 但那是猜的 —— 实测发现飞书其实能接受一部分含换行的选项名，
+   * 结果就是这些值白白被跳过、单元格留空。正确做法是**先全部尝试**，
+   * 失败的那些再由调用方处理（降级为文本 / 报错）。
+   */
   const missing = wanted.filter((v) => !map.has(v))
   // 全都已存在：不必再建，也不必再回读一次
   if (!missing.length) return map
 
   /*
-   * ⚠️ 必须**串行**，不能并发。
+   * 必须**串行**，不能并发。
    *
    * 曾经为了提速改成每批 4 个并发 `field.addOption()`，结果同一字段上的
-   * 并发写入互相冲突，**几乎全部失败** —— 表现就是每一行都报
-   * 「单选选项里没有 X（选项未建成）」。飞书的 addOption 不是为并发设计的。
-   *
-   * 提速只能靠"先读已有、只补缺失"，而不是并发。
+   * 并发写入互相冲突，**几乎全部失败**。飞书的 addOption 不是为并发设计的。
+   * 提速只能靠"先读已有、只补缺失"。
    */
   let firstError = ''
   for (const v of missing) {
