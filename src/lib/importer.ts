@@ -1,4 +1,4 @@
-import { FT, READONLY_TYPES, fieldTypeLabel, isOptionNameSafe, OPTION_NAME_MAX_LEN } from './field-meta'
+import { FT, READONLY_TYPES, fieldTypeLabel, hasOption, isOptionNameSafe, OPTION_NAME_MAX_LEN } from './field-meta'
 import {
   addField,
   addRecords,
@@ -479,7 +479,7 @@ export async function runImport(sheets: SourceSheet[], opts: ImportOptions): Pro
               optionMaps.set(meta.id, created)
               map = created
               // 事后检查：哪些**真的**没建成
-              const notCreated = vals.filter((v) => !created.has(v))
+              const notCreated = vals.filter((v) => !hasOption(created, v))
               if (notCreated.length > 0) {
                 const rows = findRowsForValues(sheet, col, notCreated)
                 warnings.push(
@@ -528,7 +528,7 @@ export async function runImport(sheets: SourceSheet[], opts: ImportOptions): Pro
             const created = await preAddOptions(table, sameName.id, sameName.type, vals)
             optionMaps.set(sameName.id, created)
             map = created
-            const notCreated = vals.filter((v) => !created.has(v))
+            const notCreated = vals.filter((v) => !hasOption(created, v))
             if (notCreated.length > 0) {
               const rows = findRowsForValues(sheet, col, notCreated)
               warnings.push(
@@ -631,7 +631,7 @@ export async function runImport(sheets: SourceSheet[], opts: ImportOptions): Pro
           const map = await preAddOptions(table, fieldId, effectiveType, vals)
           optionMaps.set(fieldId, map)
           // 事后检查：新建字段也可能有个别值建不成选项
-          const notCreated = vals.filter((v) => !map.has(v))
+          const notCreated = vals.filter((v) => !hasOption(map, v))
           if (notCreated.length > 0) {
             const rows = findRowsForValues(sheet, col, notCreated)
             warnings.push(

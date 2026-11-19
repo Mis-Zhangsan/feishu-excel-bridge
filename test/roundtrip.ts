@@ -10,7 +10,7 @@ import { buildXlsxBytes } from '../src/lib/excel-write'
 import type { OutSheet } from '../src/lib/excel-write'
 import { parseWorkbookFile, extractDispImgId, isDateFormat } from '../src/lib/excel-read'
 import { excelSerialToMs, formatDate, parseNumber, splitMulti } from '../src/lib/infer'
-import { FT, OPTION_NAME_MAX_LEN, isOptionNameSafe, looseOptionKey, normalizeOptionName } from '../src/lib/field-meta'
+import { FT, OPTION_NAME_MAX_LEN, findOptionId, hasOption, isOptionNameSafe, looseOptionKey, normalizeOptionName } from '../src/lib/field-meta'
 import { cellKey } from '../src/lib/types'
 import { bitableValueToExcel, toBitableValue } from '../src/lib/value-convert'
 
@@ -569,6 +569,23 @@ function checkNumberAndSplit() {
   })
   ok(looseOptionKey('A') !== looseOptionKey('a'), '大小写不同 = 不同选项（A ≠ a）')
   ok(looseOptionKey('SPF 48') === looseOptionKey('SPF48'), '只忽略空白，不忽略大小写')
+
+  /*
+   * 关键：**"写进去"和"检查有没有建成"必须用同一套比对**。
+   * 早前写入走三级、检查只走一级，于是明明写成功了却报「没能建成选项」。
+   */
+  const optMap = new Map<string, string>([['泵头坏了，挤不出料体', 'opt_1']])
+  ok(hasOption(optMap, '泵头坏了， 挤不出料体') === true, 'hasOption：带空格的原始值也判定为存在', {
+    got: hasOption(optMap, '泵头坏了， 挤不出料体'),
+  })
+  ok(findOptionId(optMap, '泵头坏了， 挤不出料体') === 'opt_1', 'findOptionId 能找到正确 id')
+  ok(hasOption(optMap, '不存在的东西') === false, '确实没有的值判 false')
+  ok(hasOption(optMap, '泵头坏了，挤不出料体\u0000') === false, '不会因为奇怪字符误判')
+
+  // 大小写必须敏感
+  const caseMap = new Map<string, string>([['ABC', 'id_upper']])
+  ok(hasOption(caseMap, 'abc') === false, 'hasOption 大小写敏感：ABC ≠ abc')
+  ok(hasOption(caseMap, 'ABC') === true, '完全一致才算命中')
   const wsOpts = new Map<string, string>()
   wsOpts.set('泵头坏了，挤不出料体', 'opt_1')
   const wsHit = toBitableValue(FT.SingleSelect, '泵头坏了， 挤不出料体', {

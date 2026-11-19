@@ -1,5 +1,5 @@
 import { bitable } from '@lark-base-open/js-sdk'
-import { FT, looseOptionKey, normalizeOptionName } from './field-meta'
+import { FT, hasOption, looseOptionKey, normalizeOptionName } from './field-meta'
 import type { FieldBrief, TableBrief } from './types'
 
 /** SDK 版本间类型名有差异，这里统一按结构化数据用，避免被类型定义绑死 */
@@ -162,20 +162,10 @@ export async function preAddOptions(
 
   const wanted = values.slice(0, 200)
   /*
-   * 判断"是否已存在"必须**两种键都查**：
-   *   - 原样值（源表原值可能就是已有选项名）
-   *   - 归一化值（已有选项名可能是带换行的旧数据）
-   * 只查一种就会出现"明明有却判成没有"→ 重复新建。
-   * 飞书本身**不做选项去重**，重复建出来的会真的出现在下拉里。
+   * 判断"是否已存在"统一走 hasOption（三级比对）。
+   * 飞书本身**不做选项去重**，判错一次就会多出一个几乎一样的选项。
    */
-  const missing = wanted.filter((v) => {
-    // 三级比对：精确 → 归一化 → 忽略空白
-    if (map.has(v)) return false
-    const norm = normalizeOptionName(v) || v
-    if (map.has(norm)) return false
-    const loose = looseOptionKey(v)
-    return !loose || !map.has(loose)
-  })
+  const missing = wanted.filter((v) => !hasOption(map, v))
   // 全都已存在：不必再建，也不必再回读一次
   if (!missing.length) return map
 

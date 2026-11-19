@@ -167,6 +167,38 @@ export function looseOptionKey(v: string): string {
 }
 
 /**
+ * 在选项表里找这个值对应的选项 id（三级比对）；找不到返回 undefined。
+ *
+ * **写入单元格**和**判断"有没有建成"**都必须用这个函数，
+ * 否则会出现"写成功了但报没建成"或反过来的矛盾。
+ */
+export function findOptionId(map: Map<string, string>, v: string): string | undefined {
+  const exact = map.get(v)
+  if (exact) return exact
+
+  const norm = normalizeOptionName(v)
+  if (norm) {
+    const byNorm = map.get(norm)
+    if (byNorm) return byNorm
+  }
+
+  const loose = looseOptionKey(v)
+  return loose ? map.get(loose) : undefined
+}
+
+/**
+ * 选项表里是否存在这个值。
+ *
+ * **所有"有没有这个选项"的判断都必须走这里**，不要在别处直接 `map.has(v)`。
+ * 因为 map 里放了三种键，直接查原始值只命中第一种 ——
+ * 典型后果：写入时用三级比对成功写进去了，事后检查却只用一级，
+ * 于是明明写成功、却报「没能建成选项」，误导用户去改字段。
+ */
+export function hasOption(map: Map<string, string>, v: string): boolean {
+  return !!findOptionId(map, v)
+}
+
+/**
  * 这个值能不能作为单选/多选的选项名。
  *
  * ⚠️ 这是**数据安全**的一道闸门，不是格式洁癖。
