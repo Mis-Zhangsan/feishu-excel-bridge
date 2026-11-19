@@ -1,5 +1,5 @@
 import { bitable } from '@lark-base-open/js-sdk'
-import { FT } from './field-meta'
+import { FT, normalizeOptionName } from './field-meta'
 import type { FieldBrief, TableBrief } from './types'
 
 /** SDK 版本间类型名有差异，这里统一按结构化数据用，避免被类型定义绑死 */
@@ -179,11 +179,18 @@ export async function preAddOptions(
    * 曾经为了提速改成每批 4 个并发 `field.addOption()`，结果同一字段上的
    * 并发写入互相冲突，**几乎全部失败**。飞书的 addOption 不是为并发设计的。
    * 提速只能靠"先读已有、只补缺失"。
+   *
+   * 建的时候用**清洗后的名字**（换行折成空格）—— 飞书对含换行的选项名
+   * 行为不一致，有的能建有的不能。清洗后重复率更高，也更稳。
    */
   let firstError = ''
+  /** 原始值 -> 清洗后的名字，建完后要把两者都映射到同一个 id */
+  const cleanedOf = new Map<string, string>()
   for (const v of missing) {
+    const c = normalizeOptionName(v) || v
+    cleanedOf.set(v, c)
     try {
-      await field.addOption(v)
+      await field.addOption(c)
     } catch (e) {
       // 不再完全静默：至少记下第一条，方便排查（选项已存在也会走到这里，属正常）
       if (!firstError) firstError = String((e as Error)?.message ?? e)
@@ -197,7 +204,18 @@ export async function preAddOptions(
    * 建完**重新 getField** 再读，确保拿到最新选项列表。
    * 这里刻意不复用上面的 field 对象 —— 多次 addOption 之后它可能是旧快照。
    */
-  return await readOptionMap(table, fieldId, map)
+  const result = await readOptionMap(table, fieldId, map)
+  /*
+   * 关键：把**原始值**也映射到清洗后选项的 id 上。
+   * 写入单元格时用的是源表原值（可能带换行），不补这一步就会查不到 id
+   * → 又被判成"选项未建成"。
+   */
+  for (const [raw, clean] of cleanedOf) {
+    if (raw === clean) continue
+    const id = result.get(clean)
+    if (id && !result.has(raw)) result.set(raw, id)
+  }
+  return result
 }
 
 /**

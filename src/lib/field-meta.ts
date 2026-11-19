@@ -130,6 +130,24 @@ export const IMPORTABLE_TYPES: { value: number; label: string }[] = [
 export const OPTION_NAME_MAX_LEN = 100
 
 /**
+ * 把值清洗成适合做选项名的形式。
+ *
+ * 飞书的单选项名对换行支持不稳定（有的能建、有的建不出），
+ * 而源表里「泵头坏了，\n挤不出料体」这种值很常见。
+ * 统一折成一行：**换行/制表符直接删掉**，再压缩多余空格。
+ *
+ * 中文里换行两侧通常是标点或汉字，直接删最自然（「坏了，挤不出」而不是「坏了， 挤不出」）；
+ * 英文场景下 `A\nB` 会粘成 `AB`，属于可接受的取舍 —— 相比"选项建不出来丢数据"，
+ * 多一个连写远没那么严重。
+ */
+export function normalizeOptionName(v: string): string {
+  return v
+    .replace(/[\r\n\t]+/g, '')
+    .replace(/\s{2,}/g, ' ')
+    .trim()
+}
+
+/**
  * 这个值能不能作为单选/多选的选项名。
  *
  * ⚠️ 这是**数据安全**的一道闸门，不是格式洁癖。

@@ -1347,6 +1347,58 @@ select.input {
   color: var(--accent-ink);
 }
 
+/* ---- 导入方式：新建 / 追加 胶囊 + 右侧目标控件 ---- */
+/*
+ * 单独占一行，不再和「表名 / 统计」挤在标题行右侧。
+ * 左胶囊定语义，右侧控件直接显示可编辑的表名或可选的表。
+ */
+.dest-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  margin-top: 9px;
+  padding-top: 9px;
+  border-top: 1px solid var(--line-soft);
+}
+
+.seg {
+  display: inline-flex;
+  flex: none;
+  padding: 2px;
+  border-radius: 999px;
+  background: #f1f5f9;
+}
+
+.seg-btn {
+  padding: 4px 13px;
+  border: 0;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--text-3);
+  font: inherit;
+  font-size: 12px;
+  line-height: 1.4;
+  cursor: pointer;
+}
+
+.seg-btn:hover {
+  color: var(--text);
+}
+
+.seg-btn.on {
+  background: #fff;
+  color: var(--text);
+  font-weight: 500;
+  box-shadow: 0 1px 2px rgba(15, 23, 42, 0.09);
+}
+
+.dest-row .dest-select,
+.dest-row .dest-name {
+  flex: 1;
+  min-width: 0;
+}
+
 /*
  * 目标表：下拉 + 名称合成一个控件。
  * 选「新建数据表」时右侧直接就是可编辑的名称 ——

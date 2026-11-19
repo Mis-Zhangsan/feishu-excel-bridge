@@ -10,7 +10,7 @@ import { buildXlsxBytes } from '../src/lib/excel-write'
 import type { OutSheet } from '../src/lib/excel-write'
 import { parseWorkbookFile, extractDispImgId, isDateFormat } from '../src/lib/excel-read'
 import { excelSerialToMs, formatDate, parseNumber, splitMulti } from '../src/lib/infer'
-import { FT, OPTION_NAME_MAX_LEN, isOptionNameSafe } from '../src/lib/field-meta'
+import { FT, OPTION_NAME_MAX_LEN, isOptionNameSafe, normalizeOptionName } from '../src/lib/field-meta'
 import { cellKey } from '../src/lib/types'
 import { bitableValueToExcel, toBitableValue } from '../src/lib/value-convert'
 
@@ -532,6 +532,21 @@ function checkNumberAndSplit() {
   ok(isOptionNameSafe('1、培训人员\n2、检重称确认') === true, '含换行的值也交给 SDK 尝试（不预判）')
   ok(isOptionNameSafe('x'.repeat(OPTION_NAME_MAX_LEN + 1)) === false, '超长值不能作为选项')
   ok(isOptionNameSafe('x'.repeat(OPTION_NAME_MAX_LEN)) === true, '恰好上限长度仍可用')
+
+  /* ---- 选项名清洗：换行折成一行 ---- */
+  ok(
+    normalizeOptionName('泵头坏了，\n挤不出料体') === '泵头坏了，挤不出料体',
+    '换行直接删掉（中文标点后不留空格）',
+    { got: normalizeOptionName('泵头坏了，\n挤不出料体') },
+  )
+  ok(
+    normalizeOptionName('薇诺娜50g清透防晒乳SPF48 PA+++\n（新包装）') ===
+      '薇诺娜50g清透防晒乳SPF48 PA+++（新包装）',
+    '长名字里的换行也被清掉',
+  )
+  ok(normalizeOptionName('A\r\nB') === 'AB', 'CRLF 同样处理')
+  ok(normalizeOptionName('  正常文本  ') === '正常文本', '首尾空白去掉')
+  ok(normalizeOptionName('正常文本') === '正常文本', '没有换行的值保持原样')
 
   /* ---- 日期格式识别 ---- */
   ok(isDateFormat('yyyy-mm-dd') === true, '「yyyy-mm-dd」识别为日期')

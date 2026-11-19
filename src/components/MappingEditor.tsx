@@ -192,49 +192,92 @@ export default function MappingEditor({ sheets, tables, onChange, onLoadFields }
                 </span>
               )}
 
-              <div className="dest-combo">
-                <select
-                  className="dest-select"
-                  aria-label="导入到"
-                  title="选择导入到新建数据表，还是追加到已有数据表"
-                  value={sheet.importMode === 'append' ? sheet.importTableId : '__new__'}
-                  onChange={(e) => {
-                    const v = e.target.value
-                    mutate((draft) => {
-                      const s = draft[si]
-                      if (v === '__new__') {
+              {/*
+                目标区：左边是「新建 / 追加」胶囊切换，右边随模式变
+                  · 新建 → 表名输入框（可直接改名）
+                  · 追加 → 目标数据表下拉（默认第一张表）
+
+                原来是「新建数据表 / 追加到：xxx」混在一个 select 里，
+                既占宽度又要靠文字区分语义，右侧还被挤到边缘。
+              */}
+              <div className="dest-row">
+                <div className="seg" role="tablist" aria-label="导入方式">
+                  <button
+                    type="button"
+                    role="tab"
+                    aria-selected={!appendMode}
+                    className={!appendMode ? 'seg-btn on' : 'seg-btn'}
+                    onClick={() => {
+                      if (!appendMode) return
+                      mutate((draft) => {
+                        const s = draft[si]
                         s.importMode = 'create'
                         s.importTableId = ''
-                        // 回到「新建表」模式：清掉绑定，所有字段都变成"将新建"
+                        // 切回新建：清掉绑定，所有字段都变成"将新建"
                         s.columns.forEach((c) => {
                           c.targetFieldId = ''
                           c.mappingTouched = false
                         })
-                      } else {
+                      })
+                    }}
+                  >
+                    新建
+                  </button>
+                  <button
+                    type="button"
+                    role="tab"
+                    aria-selected={appendMode}
+                    className={appendMode ? 'seg-btn on' : 'seg-btn'}
+                    onClick={() => {
+                      if (appendMode) return
+                      mutate((draft) => {
+                        const s = draft[si]
                         s.importMode = 'append'
+                        // 默认选中第一张表
+                        s.importTableId = tables[0]?.id ?? ''
+                        s.columns.forEach((c) => {
+                          c.targetFieldId = ''
+                          c.mappingTouched = false
+                        })
+                      })
+                    }}
+                  >
+                    追加
+                  </button>
+                </div>
+
+                {appendMode ? (
+                  <select
+                    className="dest-select"
+                    aria-label="追加到哪个数据表"
+                    title="选择要追加到的数据表"
+                    value={sheet.importTableId}
+                    onChange={(e) => {
+                      const v = e.target.value
+                      mutate((draft) => {
+                        const s = draft[si]
                         s.importTableId = v
                         // 换了目标表：清空绑定并允许重新自动匹配
                         s.columns.forEach((c) => {
                           c.targetFieldId = ''
                           c.mappingTouched = false
                         })
-                      }
-                    })
-                  }}
-                >
-                  <option value="__new__">新建数据表</option>
-                  {tables.map((t) => (
-                    <option key={t.id} value={t.id}>
-                      追加到：{t.name}
-                    </option>
-                  ))}
-                </select>
-                {sheet.importMode === 'create' && (
+                      })
+                    }}
+                  >
+                    {tables.map((t) => (
+                      <option key={t.id} value={t.id}>
+                        {t.name}
+                      </option>
+                    ))}
+                  </select>
+                ) : (
                   <input
                     className="dest-name"
                     value={sheet.importTableName}
-                    placeholder="表名称"
-                    title="新数据表的名称"
+                    placeholder="新数据表名称"
+                    title="新数据表的名称，可以直接改"
+                    aria-label="新数据表名称"
                     onChange={(e) => {
                       const v = e.target.value
                       mutate((draft) => {

@@ -442,7 +442,18 @@ async function main() {
   ok(/非空/.test(headText), '表头标明「非空」—— 那个数字不再是没来由的', { headText })
   ok(!!host.querySelector('.map-count'), '非空值计数放在独立的 .map-count 列')
   ok(!host.querySelector('.map-name .badge'), '计数不再挤在字段名后面（改由表头说明）')
-  ok(!!host.querySelector('.dest-combo'), '目标表是「下拉 + 名称」合并控件 .dest-combo')
+  /*
+   * 导入方式改成「胶囊切换 + 右侧目标控件」：
+   *   新建 → 右侧表名输入框（可改）
+   *   追加 → 右侧目标表下拉
+   * 并且单独占一行，不再挤在标题行右侧。
+   */
+  ok(!!host.querySelector('.dest-row'), '导入方式单独成行 .dest-row')
+  ok(!!host.querySelector('.seg'), '有「新建 / 追加」胶囊切换 .seg')
+  const segOn = host.querySelector('.seg-btn.on')?.textContent ?? ''
+  ok(/新建/.test(segOn), '默认选中「新建」', { got: segOn })
+  ok(!!host.querySelector('.dest-name'), '新建模式下右侧是表名输入框')
+  ok(!host.querySelector('.dest-select'), '新建模式下不显示目标表下拉')
   ok(!!host.querySelector('.dest-name'), '选「新建数据表」时表名可就地编辑')
   ok(!host.querySelector('.sheet-target'), '旧的独立「导入到 / 新表名称」整行已移除')
   ok(!host.querySelector('.sheet-head .btn'), '「全部启用/取消」已移出工作表头部（改到大标题同级）')
