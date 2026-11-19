@@ -451,6 +451,19 @@ export async function runExport(opts: ExportOptions): Promise<ExportResult> {
       }),
       rows,
       images: cellImages,
+      /*
+       * 标出日期列：这些单元格里放的是 Excel 序列号（数字），
+       * 写入时要给它们设日期格式，否则 Excel 里显示成一串 4 万多的数字。
+       */
+      dateCols: columns
+        .map((c, i) =>
+          c.field.type === FT.DateTime ||
+          c.field.type === FT.CreatedTime ||
+          c.field.type === FT.ModifiedTime
+            ? i
+            : -1,
+        )
+        .filter((i) => i >= 0),
     })
 
     summary.push({ table: tableName, records: records.length, images: cellImages.length })

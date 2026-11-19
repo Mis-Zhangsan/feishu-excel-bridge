@@ -89,21 +89,28 @@ export async function addField(table: AnyTable, name: string, type: number): Pro
  * @param keepFieldIds 真正承载数据的字段 id（导入时新建或复用的）
  * @param renamedTo    被征用的默认列 -> 目标字段名
  */
+/**
+ * 把自动生成的默认列改造成目标字段。
+ *
+ * 返回值必须带上**实际生效的类型** —— 请求的类型不受支持时会降级为「多行文本」，
+ * 如果这时还对外报"成功、类型是附件/日期"，调用方就会用错误的转换器去写值
+ * （附件 token 数组 / 毫秒数 被塞进文本字段，通常直接丢数据）。
+ */
 export async function adoptDefaultField(
   table: AnyTable,
   fieldId: string,
   name: string,
   type: number,
-): Promise<boolean> {
+): Promise<{ ok: boolean; type: number; downgraded: boolean }> {
   try {
     await table.setField(fieldId, { name, type } as any)
-    return true
+    return { ok: true, type, downgraded: false }
   } catch {
     try {
       await table.setField(fieldId, { name, type: FT.Text } as any)
-      return true
+      return { ok: true, type: FT.Text, downgraded: true }
     } catch {
-      return false
+      return { ok: false, type, downgraded: false }
     }
   }
 }
@@ -132,7 +139,14 @@ export async function preAddOptions(
   if (!values.length) return map
   try {
     const field: any = await table.getField(fieldId)
-    if (typeof field?.addOption !== 'function') return map
+    if (typeof field?.addOption !== 'function') {
+      /*
+       * 这个 SDK 实现没有 addOption —— 至少把**已有选项**读出来。
+       * 早前直接 return 空表，调用方看到的 Map.size === 0，
+       * 会误以为"没有选项信息"从而退回纯文本写单选 → 单元格静默空白。
+       */
+      return await readOptionMap(table, fieldId, map)
+    }
     for (const v of values.slice(0, 200)) {
       try {
         await field.addOption(v)
@@ -174,15 +188,47 @@ export async function readOptionMap(
   return map
 }
 
-export async function addRecords(table: AnyTable, records: { fields: Record<string, unknown> }[]): Promise<number> {
+export type AddRecordsResult = {
+  /** 实际写进去的条数（含出错前已经成功的批次） */
+  written: number
+  /** 失败发生在第几条（0-based），未失败则为 undefined */
+  failedAt?: number
+  /** 可读的失败说明，已带上批次与行号范围 */
+  error?: string
+}
+
+/**
+ * 分批写入记录。
+ *
+ * ⚠️ 部分失败时必须把**已写入的条数**报回去。
+ *
+ * 早前是「第 N 批抛错就直接往外抛」，调用方 written 还是 0 ——
+ * 用户看到「写入 0 条 / 导入失败」，但前面几批其实已经落库了。
+ * 他再点一次导入，就会产生一批重复数据，且没有任何提示能让他察觉。
+ */
+export async function addRecords(
+  table: AnyTable,
+  records: { fields: Record<string, unknown> }[],
+): Promise<AddRecordsResult> {
   const CHUNK = 200 // 官方限制：单次 200 条
-  let n = 0
+  let written = 0
   for (let i = 0; i < records.length; i += CHUNK) {
     const slice = records.slice(i, i + CHUNK)
-    const res = await table.addRecords(slice)
-    n += Array.isArray(res) ? res.length : slice.length
+    try {
+      const res = await table.addRecords(slice)
+      written += Array.isArray(res) ? res.length : slice.length
+    } catch (e) {
+      const batchNo = Math.floor(i / CHUNK) + 1
+      return {
+        written,
+        failedAt: i,
+        error:
+          `第 ${batchNo} 批（第 ${i + 1}–${i + slice.length} 条）写入失败：` +
+          String((e as Error)?.message ?? e),
+      }
+    }
   }
-  return n
+  return { written }
 }
 
 export async function fetchAllRecords(table: AnyTable): Promise<any[]> {
@@ -322,8 +368,13 @@ export type UploadFileTiming = {
 export type UploadOutcome = {
   tokens: (string | null)[]
   failures: { index: number; name: string; message: string }[]
-  /** 每个文件的耗时明细（批量成功的按文件均值摊分） */
-  timings: UploadFileTiming[]
+  /**
+   * 每个文件的耗时明细，**下标与传入的 files 一一对应**（没跑到的位置为 null）。
+   *
+   * 早前用 push 累积，一旦某批「部分成功 + 部分兜底」或中途取消，
+   * 数组就比 files 短且错位 —— 界面上会把 A 图的耗时显示到 B 图那一行。
+   */
+  timings: (UploadFileTiming | null)[]
 }
 
 /** 上传进度；`current` 让界面能显示「正在上传 xxx.jpg（3.2 MB）」 */
@@ -342,7 +393,7 @@ export function uploadFilesSerial(
   const run = async (): Promise<UploadOutcome> => {
     const tokens: (string | null)[] = new Array(files.length).fill(null)
     const failures: UploadOutcome['failures'] = []
-    const timings: UploadFileTiming[] = []
+    const timings: (UploadFileTiming | null)[] = new Array(files.length).fill(null)
     let done = 0
     const size = Math.max(1, batchSize)
     const report = (current?: UploadProgressInfo['current']) =>
@@ -374,7 +425,8 @@ export function uploadFilesSerial(
         msg = String((err as Error)?.message ?? err)
       }
       if (!ok) failures.push({ index: idx, name: f.name, message: msg ?? '上传失败' })
-      timings.push({ name: f.name, size: f.size || 0, ms: Date.now() - t0, ok, message: msg })
+      // 按下标写，保证与 files 对齐（不能 push）
+      timings[idx] = { name: f.name, size: f.size || 0, ms: Date.now() - t0, ok, message: msg }
       done++
     }
 
@@ -406,7 +458,9 @@ export function uploadFilesSerial(
       if (slice.every((_f, k) => !!tokens[i + k])) {
         // 批量成功：接口不提供单文件耗时，按文件均摊
         const each = Math.round(batchMs / slice.length)
-        slice.forEach((f) => timings.push({ name: f.name, size: f.size || 0, ms: each, ok: true }))
+        slice.forEach((f, k) => {
+          timings[i + k] = { name: f.name, size: f.size || 0, ms: each, ok: true }
+        })
         done += slice.length
       } else {
         /*
@@ -421,6 +475,15 @@ export function uploadFilesSerial(
           const idx = i + k
           if (tokens[idx]) {
             done++
+            // 批量里已经成功的，补一条均摊耗时，保证 timings 不断档
+            if (!timings[idx]) {
+              timings[idx] = {
+                name: files[idx].name,
+                size: files[idx].size || 0,
+                ms: Math.round(batchMs / slice.length),
+                ok: true,
+              }
+            }
             continue
           }
           if (opts?.shouldStop?.()) break
@@ -441,7 +504,7 @@ export function uploadFilesSerial(
                 const f = files[jdx]
                 const message = `批量上传失败，逐个重传又连续失败 ${consecutiveFail} 个，已跳过（多半是接口限流或网络问题，可稍后重试）`
                 failures.push({ index: jdx, name: f.name, message })
-                timings.push({ name: f.name, size: f.size || 0, ms: 0, ok: false, message })
+                timings[jdx] = { name: f.name, size: f.size || 0, ms: 0, ok: false, message }
                 done++
               }
               break

@@ -33,6 +33,15 @@ export type OutSheet = {
   rows: (string | number | boolean | null)[][]
   /** 需要嵌到单元格里的图片 */
   images: OutCellImage[]
+  /**
+   * 日期列的下标（0-based）。
+   *
+   * 这些单元格里放的是 Excel 序列号（数字），必须给个日期格式，
+   * 否则在 Excel 里会显示成 46053 这样的数字而不是 2026-01-31。
+   * 早前导出时把日期格式化成字符串，结果是「左对齐的文本」——
+   * 看着像日期，但不能排序、不能筛选、也不能参与日期运算。
+   */
+  dateCols?: number[]
 }
 
 export type ImageMode = 'dispimg' | 'float'
@@ -368,6 +377,20 @@ export async function buildXlsxBytes(sheets: OutSheet[], opts: WriteOptions): Pr
     const aoa: (string | number | boolean | null)[][] = [s.headers.slice(), ...s.rows.map((r) => r.slice())]
     // aoa_to_sheet 会以 [] 作为原点；用 origin 'A1' 保证行列与我们传的 0-based 完全一致
     const ws = XLSX.utils.aoa_to_sheet(aoa, { cellDates: false })
+
+    /*
+     * 日期列：值是 Excel 序列号（数字），必须补一个日期格式，
+     * 否则打开时看到的是一串 46053 而不是 2026-01-31。
+     * 表头占第 0 行，数据从第 1 行开始。
+     */
+    if (s.dateCols?.length) {
+      for (const c of s.dateCols) {
+        for (let r = 1; r <= s.rows.length; r++) {
+          const cell = ws[XLSX.utils.encode_cell({ r, c })]
+          if (cell && cell.t === 'n') cell.z = 'yyyy-mm-dd'
+        }
+      }
+    }
 
     const plan: SheetPlan = { realName, mediaRefs: [], cells: [] }
 

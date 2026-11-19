@@ -45,8 +45,12 @@ export function toBitableValue(type: number, raw: CellRaw, ctx: ConvertContext):
       return { ok: true, value: n }
     }
 
-    case FT.Checkbox:
-      return { ok: true, value: parseBool(raw) }
+    case FT.Checkbox: {
+      // 空单元格 / 无法识别的文本 → ok:false（不写），绝不当成 false 写进去
+      const b = parseBool(raw)
+      if (b === null) return { ok: false, reason: '空值' }
+      return { ok: true, value: b }
+    }
 
     case FT.DateTime: {
       const ms = parseDateMs(raw)
@@ -57,15 +61,13 @@ export function toBitableValue(type: number, raw: CellRaw, ctx: ConvertContext):
     case FT.SingleSelect: {
       const t = rawToText(raw).trim()
       if (!t) return { ok: false, reason: '空值' }
+      if (!ctx.options) {
+        return { ok: false, reason: '读不到该单选字段的选项，写入会变成空白' }
+      }
       const val = selectValue(t, ctx.options)
-      /*
-       * 目标字段确实有选项列表、但没有这个值 —— 说明选项没建成功。
-       * 这时写纯文本不会报错，但单元格会**静默变空**，等于数据消失。
-       * 与其悄悄丢数据，不如显式报错，让用户在导入结果里看到是哪一行哪一列。
-       */
-      if (typeof val === 'string' && ctx.options && ctx.options.size > 0) {
+      if (!val) {
         const brief = t.length > 30 ? `${t.slice(0, 30)}…` : t
-        return { ok: false, reason: `单选选项里没有「${brief}」（选项未建成，写入会变成空白）` }
+        return { ok: false, reason: `单选选项里没有「${brief}」（选项未建成，写入会变空白）` }
       }
       return { ok: true, value: val }
     }
@@ -73,19 +75,19 @@ export function toBitableValue(type: number, raw: CellRaw, ctx: ConvertContext):
     case FT.MultiSelect: {
       const arr = splitMulti(raw)
       if (!arr.length) return { ok: false, reason: '空值' }
-      // 同单选：选项不存在时写进去会被静默丢弃，这里显式报出来
-      if (ctx.options && ctx.options.size > 0) {
-        const missing = arr.filter((t) => !ctx.options!.has(t))
-        if (missing.length) {
-          const first = missing[0]
-          const brief = first.length > 30 ? `${first.slice(0, 30)}…` : first
-          return {
-            ok: false,
-            reason: `多选选项里没有「${brief}」${missing.length > 1 ? ` 等 ${missing.length} 个值` : ''}（写入会丢失）`,
-          }
+      if (!ctx.options) {
+        return { ok: false, reason: '读不到该多选字段的选项，写入会丢失' }
+      }
+      const missing = arr.filter((t) => !ctx.options!.has(t))
+      if (missing.length) {
+        const first = missing[0]
+        const brief = first.length > 30 ? `${first.slice(0, 30)}…` : first
+        return {
+          ok: false,
+          reason: `多选选项里没有「${brief}」${missing.length > 1 ? ` 等 ${missing.length} 个值` : ''}（写入会丢失）`,
         }
       }
-      return { ok: true, value: arr.map((t) => selectValue(t, ctx.options)) }
+      return { ok: true, value: arr.map((t) => selectValue(t, ctx.options)!) }
     }
 
     case FT.Phone:
@@ -117,17 +119,21 @@ export function toBitableValue(type: number, raw: CellRaw, ctx: ConvertContext):
 }
 
 /**
- * 把选项文本转成多维表格单选/多选单元格值。
+ * 单选/多选单元格的值。
  *
- * 形如 [{ id: 'optXXX', text: '已启用' }]。
- * 为什么必须带 id：多维表格的 setCellValue / addRecords 对单选/多选字段
- * 「不会按名字自动匹配选项」—— 传纯字符串时接口静默忽略，单元格留空，
- * 表现就是「点开字段详情能看到选项都建好了，但那一列什么都没有」。
- * 拿不到 id 时退回纯文本，至少不会把整列丢掉。
+ * 返回 `null` 表示**无法给出合法值**（选项表没读到，或表里没有这个值）。
+ *
+ * ⚠️ 早前拿不到 id 时会「退回纯文本」，而飞书对「纯文本写单选」不报错、
+ * 只是把单元格留空 —— 于是数据被静默吞掉，用户以为导入成功了。
+ * 现在改为显式失败，让上层记进错误清单，看得见。
  */
-function selectValue(text: string, options?: Map<string, string>): { id: string; text: string } | string {
-  const id = options?.get(text)
-  return id ? { id, text } : text
+function selectValue(
+  text: string,
+  options?: Map<string, string>,
+): { id: string; text: string } | null {
+  if (!options) return null
+  const id = options.get(text)
+  return id ? { id, text } : null
 }
 
 /** 反向：多维表格单元格 -> 写入 Excel 的文本/数字 */
@@ -136,8 +142,15 @@ export function bitableValueToExcel(type: number, v: unknown): string | number |
 
   if (type === FT.DateTime || type === FT.CreatedTime || type === FT.ModifiedTime) {
     const ms = typeof v === 'number' ? v : Number(v)
-    if (Number.isFinite(ms) && ms > 0) return formatDate(new Date(ms))
-    return null
+    if (!Number.isFinite(ms) || ms <= 0) return null
+    /*
+     * 返回 **Excel 序列号**（数字），而不是格式化好的字符串。
+     *
+     * 字符串在 Excel 里是「文本日期」：看着像日期，但左对齐、不能排序、
+     * 不能筛选、也不能参与日期运算。转成序列号后由写入侧给这一列设日期格式，
+     * Excel 才会把它当真正的日期。
+     */
+    return ms / 86_400_000 + 25_569
   }
   if (type === FT.Checkbox) return v === true || v === 'true' || v === 1
 

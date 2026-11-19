@@ -37,6 +37,14 @@ export function formatDate(d: Date): string {
 export function isNumericText(s: string): boolean {
   const t = s.trim()
   if (!t) return false
+  /*
+   * 纯数字串的两个陷阱，都不该当数字处理：
+   * - 长度 > 15：超出 IEEE754 安全整数，转成 number 会**改写末位**
+   *   （6958717841789123456 → …456000，用户看不出来但数据已经错了）
+   * - 前导零：`000123` 转成 123，零没了 —— 工号/条码/批次号都这样
+   * 这类值一律留作文本。
+   */
+  if (/^\d+$/.test(t) && (t.length > 15 || /^0\d+/.test(t))) return false
   return NUM_RE.test(t) || PCT_RE.test(t) || (CURRENCY_RE.test(t) && /\d/.test(t))
 }
 
@@ -46,6 +54,9 @@ export function parseNumber(v: CellRaw): number | null {
   if (typeof v === 'boolean') return v ? 1 : 0
   const t = rawToText(v).trim()
   if (!t) return null
+
+  // 长数字/前导零：转成 number 会改变原值，宁可返回 null 让它保持文本
+  if (/^\d+$/.test(t) && (t.length > 15 || /^0\d+/.test(t))) return null
 
   const pct = PCT_RE.test(t)
   /*
@@ -99,11 +110,25 @@ export function parseDateMs(v: CellRaw): number | null {
   return Number.isFinite(ms2) ? ms2 : null
 }
 
-export function parseBool(v: CellRaw): boolean {
+/**
+ * 复选框解析。
+ *
+ * 返回 `null` 表示「这个单元格没有值」—— 这一点很关键：
+ * 早前空单元格也返回 false，于是只要表里有一个复选框列，
+ * **每一行都被认为有值**（hasAny 恒为 true），「跳过空白行」彻底失效，
+ * 源表尾部几千行空行会变成一堆全 false 的空记录。
+ *
+ * 无法识别的文本同样返回 null，不要擅自当成「否」。
+ */
+export function parseBool(v: CellRaw): boolean | null {
+  if (v === null || v === undefined) return null
   if (typeof v === 'boolean') return v
   if (typeof v === 'number') return v !== 0
   const t = rawToText(v).trim().toLowerCase()
-  return t === 'true' || t === 'yes' || t === 'y' || t === '是' || t === '1' || t === '√' || t === '✓'
+  if (!t) return null
+  if (['true', 'yes', 'y', '是', '1', '√', '✓', '✔'].includes(t)) return true
+  if (['false', 'no', 'n', '否', '0', '×', '✗', '✘'].includes(t)) return false
+  return null
 }
 
 /**

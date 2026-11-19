@@ -70,7 +70,7 @@ export function extractDispImgId(formula: string): string | null {
  * 存的就是序列号，靠数字格式来显示成人能看懂的样子。
  * 先把格式里的 [条件]、"字面量"、\转义 剥离，再看是否含 y/m/d 等日期占位符。
  */
-function isDateFormat(z: string | number | undefined): boolean {
+export function isDateFormat(z: string | number | undefined): boolean {
   if (z === undefined || z === null) return false
   const s = String(z)
   if (!s) return false
@@ -78,11 +78,17 @@ function isDateFormat(z: string | number | undefined): boolean {
     .replace(/\[[^\]]*\]/g, '') // [红色]、[$-409] 之类
     .replace(/"[^"]*"/g, '') // "年" 之类的字面量
     .replace(/\\./g, '') // \ 转义
-  // 含 y / m / d 占位符即视为日期
-  return /[ymd]/i.test(cleaned)
+  /*
+   * 必须含「年」或「日」占位符才算日期。
+   *
+   * 只看 [ymd] 会把纯时间格式（`h:mm:ss`、`[h]:mm:ss`）也判成日期，
+   * 于是「工时 0.5」被换算成 1899-12-31 12:00 —— 年份完全错。
+   * `m` 在时间格式里表示"分"，单独出现不足以判定是日期。
+   */
+  return /[yd]/i.test(cleaned)
 }
 
-function cellRaw(cell: XLSX.CellObject | undefined): CellRaw {
+function cellRaw(cell: XLSX.CellObject | undefined, date1904 = false): CellRaw {
   if (!cell) return null
   const t = (cell as XLSX.CellObject).t
   const v = (cell as XLSX.CellObject).v as unknown
@@ -103,7 +109,11 @@ function cellRaw(cell: XLSX.CellObject | undefined): CellRaw {
      * （+08:05:43），于是日期会莫名退一天 —— 表现为「表里没有的日期凭空出现」。
      */
     if (isDateFormat((cell as XLSX.CellObject).z)) {
-      return new Date(excelSerialToMs(n))
+      /*
+       * 1904 日期系统（Mac 版 Excel 的旧默认）基准比 1900 系统早 1462 天。
+       * 不补这个偏移，整个工作簿的日期会**偏 4 年零 1 天**。
+       */
+      return new Date(excelSerialToMs(n + (date1904 ? 1462 : 0)))
     }
     return n
   }
@@ -396,6 +406,15 @@ export async function parseWorkbookFile(file: File, opts: ParseOptions = {}): Pr
   }
 
   /* ---- 逐 sheet 构建矩阵 / 表头 / 列 ---- */
+  /**
+   * 1904 日期系统标记（Mac 版 Excel 的旧默认）。
+   * 这类工作簿的序列号基准比 1900 系统早 1462 天，换算时要补偏移。
+   */
+  const date1904 = !!(wb as unknown as { Workbook?: { WBProps?: { date1904?: boolean } } })
+    .Workbook?.WBProps?.date1904
+  if (date1904) {
+    warnings.push('该工作簿使用 1904 日期系统（Mac Excel），日期已按此换算。')
+  }
   const sheets: SourceSheet[] = []
   for (const name of wb.SheetNames) {
     const ws = wb.Sheets[name]
@@ -412,7 +431,12 @@ export async function parseWorkbookFile(file: File, opts: ParseOptions = {}): Pr
     for (let r = 0; r <= rowEnd; r++) {
       const row: CellRaw[] = []
       for (let c = 0; c <= colEnd; c++) {
-        row.push(cellRaw(ws[XLSX.utils.encode_cell({ r, c })] as XLSX.CellObject | undefined))
+        row.push(
+          cellRaw(
+            ws[XLSX.utils.encode_cell({ r, c })] as XLSX.CellObject | undefined,
+            date1904,
+          ),
+        )
       }
       matrix.push(row)
     }

@@ -35,7 +35,16 @@ type Phase = 'config' | 'running' | 'done'
  * 空白工作表：既没有可识别的列（表头全空），也没有数据行。
  * 这种 sheet 不单独渲染映射块，只在下方汇总提示，避免占满侧栏。
  */
-const isBlankSheet = (s: SourceSheet) => s.columns.length === 0 || s.totalDataRows === 0
+/**
+ * 判定「空白工作表」。
+ *
+ * ⚠️ 不能只看 totalDataRows —— 它统计的是**有文字的**行。
+ * 一个只有表头 + 图片单元格的表，文字行数是 0，但显然不是空表；
+ * 早前会被判成空白直接从映射区剔除，整表图片悄悄丢掉。
+ * 所以只要有任意一列识别到媒体，就说明它有内容。
+ */
+const isBlankSheet = (s: SourceSheet) =>
+  s.columns.length === 0 || (s.totalDataRows === 0 && s.columns.every((c) => c.mediaCount === 0))
 
 /**
  * MappingEditor 只会回传它渲染过的（非空白）工作表，
@@ -63,6 +72,24 @@ export default function ImportPanel({ tables, reloadTables }: Props) {
   const [phase, setPhase] = useState<Phase>('config')
   const [progress, setProgress] = useState<ImportProgress | null>(null)
   const [logs, setLogs] = useState<string[]>([])
+  /**
+   * 同步维护一份日志副本。
+   *
+   * `saveRunLog` 是在事件回调里执行的，它读到的 `logs` 是**这次渲染时的旧值**，
+   * 导入过程中追加的进度日志根本进不去 —— 反馈给开发者的"最近一次日志"
+   * 永远只有解析阶段那几行。用 ref 存实时值。
+   */
+  const logsRef = useRef<string[]>([])
+
+  const pushLog = useCallback((s: string) => {
+    logsRef.current = [...logsRef.current.slice(-300), s]
+    setLogs(logsRef.current)
+  }, [])
+
+  const clearLogs = useCallback(() => {
+    logsRef.current = []
+    clearLogs()
+  }, [])
   const [result, setResult] = useState<ImportResult | null>(null)
   const [error, setError] = useState('')
   /** 非致命提示（例如用户取消） */
@@ -90,8 +117,6 @@ export default function ImportPanel({ tables, reloadTables }: Props) {
     return () => window.clearInterval(timer)
   }, [phase])
 
-  const pushLog = (s: string) => setLogs((p) => [...p.slice(-300), s])
-
   const loadFields = useCallback(async (tableId: string) => {
     return await listFields(tableId)
   }, [])
@@ -101,7 +126,7 @@ export default function ImportPanel({ tables, reloadTables }: Props) {
     setError('')
     setWarn('')
     setResult(null)
-    setLogs([])
+    clearLogs()
     setPhase('config')
     setParsing(true)
     try {
@@ -140,7 +165,7 @@ export default function ImportPanel({ tables, reloadTables }: Props) {
     setBusy(true)
     setError('')
     setWarn('')
-    setLogs([])
+    clearLogs()
     setResult(null)
     setPhase('running')
     try {
@@ -163,7 +188,8 @@ export default function ImportPanel({ tables, reloadTables }: Props) {
         summary: `${liveTableCount} 张表 · ${enabledCols} 字段 · ${totalRows} 行${
           totalMedia > 0 ? ` · ${totalMedia} 个附件（${formatBytes(uploadMedia.bytes)}）` : ''
         }`,
-        lines: logs,
+        // 用 ref 的实时值，而不是这次渲染时的旧 logs
+        lines: logsRef.current,
       })
       if (res.cancelled) {
         pushLog('已取消导入')
@@ -249,7 +275,7 @@ export default function ImportPanel({ tables, reloadTables }: Props) {
     setParsed(null)
     setResult(null)
     setError('')
-    setLogs([])
+    clearLogs()
     setProgress(null)
     setPhase('config')
     lastFile.current = null
@@ -307,10 +333,18 @@ export default function ImportPanel({ tables, reloadTables }: Props) {
               : '没有写入任何数据表，请检查下方提示'
           }
           stats={[
-            { v: liveTableCount, k: '数据表' },
-            { v: enabledCols, k: '字段' },
-            { v: totalRows, k: '行记录' },
-            { v: totalMedia, k: '附件图片' },
+            { v: result.tables.length, k: '数据表' },
+            { v: result.tables.reduce((n, t) => n + t.createdFields + t.reusedFields, 0), k: '字段' },
+            /*
+             * 用**实际写入**的记录数，不是源表行数。
+             * 勾掉列、跳过空行、转换失败都会让实际值更小，
+             * 早前显示"345 行"但表里只有 300 条，用户会以为丢数据（虽然确实可能丢了）。
+             */
+            { v: result.tables.reduce((n, t) => n + t.records, 0), k: '已写入' },
+            {
+              v: (result.uploadTimings ?? []).filter((t) => !!t).length,
+              k: '附件图片',
+            },
           ]}
           actions={
             <>
@@ -359,21 +393,28 @@ export default function ImportPanel({ tables, reloadTables }: Props) {
           )}
 
           {/* 附件耗时排行 —— 进度长时间不动时，一眼看出是哪张图在拖 */}
-          {result.uploadTimings && result.uploadTimings.length > 0 && (
-            <>
-              <div className="log-title" style={{ color: 'var(--text-3)' }}>
-                附件上传耗时（最慢 20 个 / 共 {result.uploadTimings.length} 个）
-              </div>
-              <div className="log">
-                {result.uploadTimings
-                  .filter((t) => t.ok)
-                  .sort((a, b) => b.ms - a.ms)
-                  .slice(0, 20)
-                  .map((t) => `${(t.ms / 1000).toFixed(1)}s\t${formatBytes(t.size)}\t${t.name}`)
-                  .join('\n')}
-              </div>
-            </>
-          )}
+          {(() => {
+            // timings 与文件同下标、可能有空位（未跑到），先滤掉再排序
+            const valid = (result.uploadTimings ?? []).filter(
+              (t): t is NonNullable<typeof t> => !!t,
+            )
+            if (!valid.length) return null
+            return (
+              <>
+                <div className="log-title" style={{ color: 'var(--text-3)' }}>
+                  附件上传耗时（最慢 20 个 / 共 {valid.length} 个）
+                </div>
+                <div className="log">
+                  {valid
+                    .filter((t) => t.ok)
+                    .sort((a, b) => b.ms - a.ms)
+                    .slice(0, 20)
+                    .map((t) => `${(t.ms / 1000).toFixed(1)}s\t${formatBytes(t.size)}\t${t.name}`)
+                    .join('\n')}
+                </div>
+              </>
+            )
+          })()}
 
           {logs.length > 0 && (
             <>

@@ -8,7 +8,6 @@ import {
   getTable,
   orderedFields,
   preAddOptions,
-  readOptionMap,
   uploadFilesSerial,
 } from './base-api'
 import type { UploadFileTiming } from './base-api'
@@ -49,7 +48,7 @@ export type ImportResult = {
   /** 用户中途取消（已写入的数据表与记录不会回滚） */
   cancelled?: boolean
   /** 附件上传耗时明细（按耗时降序），用于定位「哪张图拖慢了整次导入」 */
-  uploadTimings?: UploadFileTiming[]
+  uploadTimings?: (UploadFileTiming | null)[]
 }
 
 export type ImportOptions = {
@@ -159,7 +158,7 @@ export async function runImport(sheets: SourceSheet[], opts: ImportOptions): Pro
 
   const mediaBySheet = new Map<number, Map<string, MediaRef[]>>()
   /** 附件上传耗时明细（保留到结果里，用于定位是哪张图拖慢了整次导入） */
-  let uploadTimings: UploadFileTiming[] = []
+  let uploadTimings: (UploadFileTiming | null)[] = []
   if (stop()) return cancelledResult()
 
   /*
@@ -206,9 +205,9 @@ export async function runImport(sheets: SourceSheet[], opts: ImportOptions): Pro
     )
     uploadTimings = timings
 
-    // 回填每张图的耗时，并把失败的标出来
+    // 回填每张图的耗时，并把失败的标出来（timings 与 tasks 同下标，可能为 null）
     timings.forEach((t, i) => {
-      if (!mediaItems[i]) return
+      if (!t || !mediaItems[i]) return
       mediaItems[i].meta = `${fmtSize(t.size)} · ${(t.ms / 1000).toFixed(1)}s`
       if (!t.ok) mediaItems[i].state = 'fail'
     })
@@ -241,15 +240,18 @@ export async function runImport(sheets: SourceSheet[], opts: ImportOptions): Pro
      * 不是卡死，而是某个几十 MB 的文件在串行上传里慢慢传。
      * 把文件名和体积列出来，用户才知道该去处理哪张图。
      */
-    const totalBytes = timings.reduce((n, t) => n + t.size, 0)
-    const slow = timings.filter((t) => t.ok && t.ms > SLOW_UPLOAD_MS).sort((a, b) => b.ms - a.ms)
+    const validTimings = timings.filter((t): t is UploadFileTiming => !!t)
+    const totalBytes = validTimings.reduce((n, t) => n + t.size, 0)
+    const slow = validTimings
+      .filter((t) => t.ok && t.ms > SLOW_UPLOAD_MS)
+      .sort((a, b) => b.ms - a.ms)
     if (slow.length > 0) {
       const top = slow
         .slice(0, 5)
         .map((t) => `${t.name}（${fmtSize(t.size)}，${(t.ms / 1000).toFixed(1)} 秒）`)
       warnings.push(
         `有 ${slow.length} 个附件单个上传耗时超过 ${SLOW_UPLOAD_MS / 1000} 秒` +
-          `（本次共 ${timings.length} 个附件，合计 ${fmtSize(totalBytes)}）。` +
+          `（本次共 ${validTimings.length} 个附件，合计 ${fmtSize(totalBytes)}）。` +
           `最慢的是：${top.join('、')}。附件只能串行上传，超大文件会让进度长时间停在同一处。`,
       )
     } else if (totalBytes > 100 * 1024 * 1024) {
@@ -291,11 +293,26 @@ export async function runImport(sheets: SourceSheet[], opts: ImportOptions): Pro
       /* 忽略 */
     }
 
-    let existing: FieldBrief[] = []
+    /*
+     * 读字段列表失败必须**终止这张表**，不能当成"表里没有字段"。
+     *
+     * 当成空列表的后果：所有列都走「新建字段」分支，同名 addField 失败、
+     * 降级也失败，最后报一堆「新建字段失败」—— 用户以为是字段的问题，
+     * 实际上是这次读取超时了。重试一次通常就好。
+     */
+    let existing: FieldBrief[]
     try {
       existing = await orderedFields(table)
-    } catch {
-      existing = []
+    } catch (e) {
+      errors.push({
+        sheet: sheet.name,
+        row: -1,
+        column: '—',
+        message:
+          `无法读取目标表的字段列表：${String((e as Error)?.message ?? e)}。` +
+          `已跳过该工作表，请重试（通常是网络或限流导致的瞬时失败）。`,
+      })
+      continue
     }
     const byName = new Map(existing.map((f) => [f.name, f]))
 
@@ -318,19 +335,23 @@ export async function runImport(sheets: SourceSheet[], opts: ImportOptions): Pro
     const adoptSpare = async (wantName: string, wantType: number, col: SourceColumn): Promise<string> => {
       const spare = spareFields.shift()
       if (!spare) return ''
-      let effectiveType = wantType
-      let ok = await adoptDefaultField(table, spare.id, wantName, effectiveType)
-      if (!ok && wantType !== FT.Text) {
-        // 该类型在当前租户不受支持时降级为多行文本
-        effectiveType = FT.Text
-        ok = await adoptDefaultField(table, spare.id, wantName, effectiveType)
-        if (ok) {
-          warnings.push(`字段「${wantName}」以「${fieldTypeLabel(wantType)}」创建失败，已降级为多行文本。`)
-        }
+      let res = await adoptDefaultField(table, spare.id, wantName, wantType)
+      // 该类型在当前租户不受支持时降级为多行文本（返回的 type 会告诉我们实际值）
+      if (!res.ok && wantType !== FT.Text) {
+        res = await adoptDefaultField(table, spare.id, wantName, FT.Text)
       }
-      if (!ok) {
+      if (!res.ok) {
         spareFields.unshift(spare)
         return ''
+      }
+      /*
+       * ⚠️ 用**实际生效的类型**，不能用请求的类型。
+       * 早前这里直接写 wantType，于是「请求附件、实际降级成文本」时，
+       * resolved.type 仍是附件，后续会把 token 数组写进文本字段 —— 图片直接丢。
+       */
+      const effectiveType = res.type
+      if (res.downgraded) {
+        warnings.push(`字段「${wantName}」以「${fieldTypeLabel(wantType)}」创建失败，已降级为多行文本。`)
       }
       const meta: FieldBrief = { id: spare.id, name: wantName, type: effectiveType }
       existing.push(meta)
@@ -362,19 +383,24 @@ export async function runImport(sheets: SourceSheet[], opts: ImportOptions): Pro
           resolved.push({ column: col, fieldId: meta.id, type: meta.type, name: meta.name, isNew: false })
           reusedFields++
           if (meta.type === FT.SingleSelect || meta.type === FT.MultiSelect) {
-            // 目标字段是单选/多选：值不适合做选项时，写进去会变成空白，必须提前告知
+            /*
+             * 追加模式必须**补建选项** —— 早前这里只 readOptionMap（只读不建），
+             * 于是源表里出现目标表没有的取值时，那些单元格全部写不进去（静默变空）。
+             * 这正是「追加导入只写进去几条」的主要成因之一。
+             */
             const vals = collectSelectValues(sheet, col, meta.type)
-            const badCount = vals.filter((v) => !isOptionNameSafe(v)).length
+            const safe = vals.filter((v) => isOptionNameSafe(v))
+            const badCount = vals.length - safe.length
             if (badCount > 0) {
               warnings.push(
                 `「${sheet.name}」的字段「${col.header}」有 ${badCount} 个值含换行或超过 ${OPTION_NAME_MAX_LEN} 字，` +
-                  `而目标字段「${meta.name}」是${fieldTypeLabel(meta.type)} —— 这些值可能显示为空。` +
-                  `建议先把目标字段改成「多行文本」再重新导入。`,
+                  `无法作为${fieldTypeLabel(meta.type)}选项，这些单元格会为空。` +
+                  `建议把目标字段改成「多行文本」后重新导入。`,
               )
             }
             let map = optionMaps.get(meta.id)
             if (!map) {
-              map = await readOptionMap(table, meta.id)
+              map = await preAddOptions(table, meta.id, meta.type, safe)
               optionMaps.set(meta.id, map)
             }
           }
@@ -410,18 +436,20 @@ export async function runImport(sheets: SourceSheet[], opts: ImportOptions): Pro
         resolved.push({ column: col, fieldId: sameName.id, type: sameName.type, name: sameName.name, isNew: false })
         reusedFields++
         if (sameName.type === FT.SingleSelect || sameName.type === FT.MultiSelect) {
+          // 同「手动映射」分支：追加时必须补建选项，否则新值全部写不进去
           const vals = collectSelectValues(sheet, col, sameName.type)
-          const badCount = vals.filter((v) => !isOptionNameSafe(v)).length
+          const safe = vals.filter((v) => isOptionNameSafe(v))
+          const badCount = vals.length - safe.length
           if (badCount > 0) {
             warnings.push(
               `「${sheet.name}」的字段「${col.header}」有 ${badCount} 个值含换行或超过 ${OPTION_NAME_MAX_LEN} 字，` +
-                `而目标表里的同名字段是${fieldTypeLabel(sameName.type)} —— 这些值可能显示为空。` +
-                `建议先把该字段改成「多行文本」再重新导入。`,
+                `无法作为${fieldTypeLabel(sameName.type)}选项，这些单元格会为空。` +
+                `建议把该字段改成「多行文本」后重新导入。`,
             )
           }
           let map = optionMaps.get(sameName.id)
           if (!map) {
-            map = await readOptionMap(table, sameName.id)
+            map = await preAddOptions(table, sameName.id, sameName.type, safe)
             optionMaps.set(sameName.id, map)
           }
         }
@@ -586,16 +614,28 @@ export async function runImport(sheets: SourceSheet[], opts: ImportOptions): Pro
 
     /* --- 写回 --- */
     report('records', '正在写入记录', 0, records.length, `${sheet.name} · 共 ${records.length} 条记录`)
-    let written = 0
-    try {
-      written = await addRecords(table, records)
-    } catch (e) {
+    const addRes = await addRecords(table, records)
+    const written = addRes.written
+
+    if (addRes.error) {
+      /*
+       * 关键：明确告诉用户「已经写进去多少」。
+       * 否则他看到"失败"就会重导一次，而那些已落库的记录会变成重复数据。
+       */
       errors.push({
         sheet: sheet.name,
         row: -1,
         column: '—',
-        message: `写入记录失败：${String((e as Error)?.message ?? e)}`,
+        message:
+          `${addRes.error}。**已成功写入 ${written} 条，请勿直接重复导入** —— ` +
+          `若要重试，请先删除已写入的记录。`,
       })
+    } else if (written < records.length) {
+      // 接口没报错但少写了，也要说出来（可能是个别记录被服务端拒绝）
+      warnings.push(
+        `「${sheet.name}」计划写入 ${records.length} 条，实际写入 ${written} 条，` +
+          `${records.length - written} 条未被接受。请核对后再决定是否补充。`,
+      )
     }
     report('records', '正在写入记录', records.length, records.length, `${sheet.name} · 完成`)
 

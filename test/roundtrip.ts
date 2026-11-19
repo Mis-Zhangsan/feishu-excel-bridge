@@ -8,11 +8,11 @@ import JSZip from 'jszip'
 import * as XLSX from 'xlsx'
 import { buildXlsxBytes } from '../src/lib/excel-write'
 import type { OutSheet } from '../src/lib/excel-write'
-import { parseWorkbookFile, extractDispImgId } from '../src/lib/excel-read'
+import { parseWorkbookFile, extractDispImgId, isDateFormat } from '../src/lib/excel-read'
 import { excelSerialToMs, formatDate, parseNumber, splitMulti } from '../src/lib/infer'
 import { FT, OPTION_NAME_MAX_LEN, isOptionNameSafe } from '../src/lib/field-meta'
 import { cellKey } from '../src/lib/types'
-import { toBitableValue } from '../src/lib/value-convert'
+import { bitableValueToExcel, toBitableValue } from '../src/lib/value-convert'
 
 /** 图片指纹，用于逐字节比对 */
 const hashOf = (b: Uint8Array) => createHash('md5').update(b).digest('hex')
@@ -313,9 +313,17 @@ function checkSelectValue() {
   ok(arr.length === 2, '多选拆成 2 个值', arr)
   ok(arr.every((v) => !!v.id), '多选每一项都带选项 id', arr)
 
-  // 拿不到选项映射时退回纯文本，至少不丢数据
-  const fallback = toBitableValue(3, '未知部门', { media: [] })
-  ok(fallback.ok && fallback.value === '未知部门', '没有选项映射时退回纯文本', fallback.ok ? fallback.value : fallback.reason)
+  /*
+   * 读不到选项时**必须显式失败**，不能退回纯文本。
+   * 飞书对「纯文本写单选」不报错，只把单元格留空 —— 那等于静默丢数据。
+   * 现在改为 ok:false，让导入结果里能看到是哪一格。
+   */
+  const noMap = toBitableValue(3, '未知部门', { media: [] })
+  ok(!noMap.ok, '没有选项映射时显式失败（不再静默退回纯文本）', noMap.ok ? noMap.value : noMap.reason)
+
+  // 有选项表但没有这个值，同样要显式失败
+  const missing = toBitableValue(3, '不存在的部门', { media: [], options })
+  ok(!missing.ok, '选项表里没有该值时显式失败', missing.ok ? missing.value : missing.reason)
 
   // 空值不写
   ok(!toBitableValue(3, '', { media: [], options }).ok, '空值不产生写入')
@@ -519,6 +527,28 @@ function checkNumberAndSplit() {
   ok(isOptionNameSafe('1、培训人员\n2、检重称确认') === false, '含换行的值不能作为选项')
   ok(isOptionNameSafe('x'.repeat(OPTION_NAME_MAX_LEN + 1)) === false, '超长值不能作为选项')
   ok(isOptionNameSafe('x'.repeat(OPTION_NAME_MAX_LEN)) === true, '恰好上限长度仍可用')
+
+  /* ---- 日期格式识别 ---- */
+  ok(isDateFormat('yyyy-mm-dd') === true, '「yyyy-mm-dd」识别为日期')
+  ok(isDateFormat('yyyy/m/d h:mm') === true, '「yyyy/m/d h:mm」识别为日期')
+  ok(isDateFormat('0.00') === false, '「0.00」不是日期')
+  ok(isDateFormat('General') === false, '「General」不是日期')
+  /*
+   * 纯时间格式必须排除：否则「工时 0.5」会被换算成 1899-12-31 12:00，
+   * 年份完全错（这一条是真实的坑）。
+   */
+  ok(isDateFormat('h:mm:ss') === false, '「h:mm:ss」纯时间不算日期')
+  ok(isDateFormat('[h]:mm:ss') === false, '「[h]:mm:ss」纯时间不算日期')
+
+  /* ---- 导出：日期必须是序列号（数字），不是文本 ---- */
+  const dateMs = Date.UTC(2026, 0, 31) // 2026-01-31
+  const serial = bitableValueToExcel(FT.DateTime, dateMs)
+  ok(typeof serial === 'number', '导出日期返回数字序列号（不是字符串）', { got: typeof serial })
+  ok(
+    typeof serial === 'number' && formatDate(new Date((serial - 25569) * 86400000)) === '2026-01-31',
+    '导出的序列号能无损还原成 2026-01-31',
+    { serial, back: typeof serial === 'number' ? formatDate(new Date((serial - 25569) * 86400000)) : '' },
+  )
 }
 
 async function main() {
