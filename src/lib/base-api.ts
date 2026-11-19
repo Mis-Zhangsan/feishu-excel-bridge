@@ -174,30 +174,57 @@ export async function preAddOptions(
   if (!missing.length) return map
 
   /*
-   * 必须**串行**，不能并发。
+   * 建选项：**优先用批量接口 `addOptions`**。
    *
-   * 曾经为了提速改成每批 4 个并发 `field.addOption()`，结果同一字段上的
-   * 并发写入互相冲突，**几乎全部失败**。飞书的 addOption 不是为并发设计的。
-   * 提速只能靠"先读已有、只补缺失"。
+   * 这是"字段/选项准备 168 秒"的根因所在 —— 之前是一个值一次 `addOption`，
+   * 几十上百个唯一值就是几十上百次网络往返；而 SDK 提供了一次传数组的
+   * `addOptions(optionList)`，一次请求就能建完。
    *
-   * 建的时候用**清洗后的名字**（换行折成空格）—— 飞书对含换行的选项名
-   * 行为不一致，有的能建有的不能。清洗后重复率更高，也更稳。
+   * 名字先清洗（换行折成一行）并去重 —— 清洗后可能撞名，
+   * 重复传给 addOptions 会报错。
    */
   let firstError = ''
   /** 原始值 -> 清洗后的名字，建完后要把两者都映射到同一个 id */
   const cleanedOf = new Map<string, string>()
+  const cleanedNames: string[] = []
+  const seen = new Set<string>()
   for (const v of missing) {
     const c = normalizeOptionName(v) || v
     cleanedOf.set(v, c)
+    if (seen.has(c)) continue
+    seen.add(c)
+    cleanedNames.push(c)
+  }
+
+  const fieldAny = field as any
+  if (typeof fieldAny.addOptions === 'function') {
     try {
-      await field.addOption(c)
+      await fieldAny.addOptions(cleanedNames.map((name) => ({ name })))
     } catch (e) {
-      // 不再完全静默：至少记下第一条，方便排查（选项已存在也会走到这里，属正常）
-      if (!firstError) firstError = String((e as Error)?.message ?? e)
+      // 批量失败（个别名字非法会让整批被拒）→ 退回逐个，保证能建的都建上
+      firstError = String((e as Error)?.message ?? e)
+      for (const c of cleanedNames) {
+        try {
+          await fieldAny.addOption(c)
+        } catch {
+          /* 已存在 / 非法值 */
+        }
+      }
+    }
+  } else {
+    // 老版本 SDK 没有 addOptions：只能逐个（慢，但正确）
+    for (const c of cleanedNames) {
+      try {
+        await fieldAny.addOption(c)
+      } catch (e) {
+        if (!firstError) firstError = String((e as Error)?.message ?? e)
+      }
     }
   }
   if (firstError) {
-    console.warn(`[excel-bridge] 创建选项失败（字段 ${fieldId}，共 ${missing.length} 个待建）：${firstError}`)
+    console.warn(
+      `[excel-bridge] 批量建选项回退（字段 ${fieldId}，共 ${cleanedNames.length} 个）：${firstError}`,
+    )
   }
 
   /*

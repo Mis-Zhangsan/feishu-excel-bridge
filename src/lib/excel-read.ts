@@ -184,6 +184,8 @@ async function readSheetDrawings(
     if (!ridToMedia.size) continue
 
     const anchors = drawXml.match(ANCHOR_RE) ?? []
+    /** 浮动图里定位/读取失败的张数，最后统一报，不静默丢 */
+    let lost = 0
     for (const anchor of anchors) {
       const fromBlock = findAll(anchor, 'from')[0]
       if (!fromBlock) continue
@@ -198,19 +200,28 @@ async function readSheetDrawings(
         const blip = firstOpenTag(pic, 'blip')
         const embed = blip ? attr(blip, 'r:embed') : null
         const mediaPath = embed ? ridToMedia.get(embed) : null
-        if (!mediaPath) continue
+        if (!mediaPath) {
+          lost++
+          continue
+        }
         const cNvPr = firstOpenTag(pic, 'cNvPr')
         const descr = cNvPr ? attr(cNvPr, 'descr') : null
         const file = await mediaLoader({
           path: mediaPath,
           fileName: descr && /\.[A-Za-z0-9]{2,5}$/.test(descr) ? descr : basename(mediaPath),
         })
-        if (!file) continue
+        if (!file) {
+          lost++
+          continue
+        }
         const key = cellKey(row, col)
         const list = out.get(key) ?? []
         list.push(file)
         out.set(key, list)
       }
+    }
+    if (lost > 0) {
+      warnings.push(`工作表有 ${lost} 张浮动图片未能读取（关系缺失或部件损坏），已跳过。`)
     }
   }
   return out
@@ -386,23 +397,55 @@ export async function parseWorkbookFile(file: File, opts: ParseOptions = {}): Pr
   }
 
   const matchedByName = dispImgCells.filter((d) => cellImages.byId.has(d.id)).length
+  /*
+   * 位置兜底必须**非常保守**。
+   *
+   * cellimages.xml 里 `<pic>` 的顺序是 WPS 的**图片创建顺序**，不等于单元格顺序 ——
+   * 按"第 i 个单元格配第 i 张图"猜，很容易张冠李戴（图片跑到别的格子里，
+   * 用户看到的就是"有的图消失了、有的图串位了"）。
+   *
+   * 所以只在两个条件同时满足时才启用：
+   *   1. 一个 ID 都没匹配上（说明 ID 体系完全不同）
+   *   2. 图片数量与 DISPIMG 单元格数量**恰好相等**（顺序对应的可能性才成立）
+   */
   const usePositionalFallback =
-    dispImgCells.length > 0 && matchedByName < dispImgCells.length && cellImages.ordered.length >= dispImgCells.length
-  if (usePositionalFallback && matchedByName === 0 && cellImages.ordered.length) {
-    warnings.push('cellimages.xml 中未找到与 DISPIMG 公式对应的 ID，已按出现顺序做位置匹配。')
+    dispImgCells.length > 0 &&
+    matchedByName === 0 &&
+    cellImages.ordered.length === dispImgCells.length
+  if (usePositionalFallback) {
+    warnings.push(
+      'cellimages.xml 未提供可匹配的 ID，已按「数量相等」做顺序匹配。若图片错位，请改用 WPS 重新另存后导入。',
+    )
+  } else if (dispImgCells.length > 0 && matchedByName < dispImgCells.length) {
+    warnings.push(
+      `有 ${dispImgCells.length - matchedByName} 个内嵌图片的 ID 在 cellimages.xml 里找不到对应项` +
+        `（共 ${dispImgCells.length} 个单元格带 DISPIMG）。这些单元格会没有图片，建议用 WPS 重存为 .xlsx 后重试。`,
+    )
   }
 
   const dispImgMedia = new Map<string, File[]>()
+  /** 记录定位/读取失败的图片数，最后统一报出来，不静默丢 */
+  let dispLost = 0
   for (let i = 0; i < dispImgCells.length; i++) {
     const d = dispImgCells[i]
     const loc = cellImages.byId.get(d.id) ?? (usePositionalFallback ? cellImages.ordered[i] : undefined)
-    if (!loc) continue
+    if (!loc) {
+      dispLost++
+      continue
+    }
     const f = await mediaLoader(loc)
-    if (!f) continue
+    if (!f) {
+      // 部件损坏 / 解压失败：不能再静默跳过
+      dispLost++
+      continue
+    }
     const key = `${d.sheet}\u0000${cellKey(d.row, d.col)}`
     const list = dispImgMedia.get(key) ?? []
     list.push(f)
     dispImgMedia.set(key, list)
+  }
+  if (dispLost > 0) {
+    warnings.push(`有 ${dispLost} 个内嵌图片未能读取（部件缺失、损坏或 ID 对不上），已跳过。`)
   }
 
   /* ---- 逐 sheet 构建矩阵 / 表头 / 列 ---- */
@@ -490,6 +533,9 @@ export async function parseWorkbookFile(file: File, opts: ParseOptions = {}): Pr
     const dataRowOffset = headerRowIndex + 1
 
     const columns: SourceColumn[] = []
+    /** 表头行被跳过的图片数（这些不会导入，需要明确告知用户） */
+    let headerMediaSkipped = 0
+    const headerMediaCols = new Set<string>()
     for (let c = 0; c < colCount; c++) {
       const values: CellRaw[] = dataRows.map((row) => row[c] ?? null)
       const nonEmpty = values.filter((v) => v !== null && v !== undefined && rawToText(v).trim() !== '')
@@ -499,9 +545,18 @@ export async function parseWorkbookFile(file: File, opts: ParseOptions = {}): Pr
         const list = mediaByCell.get(cellKey(r, c))
         if (list) mediaCount += list.length
       }
-      // 表头行本身也可能挂着图片（浮动图常被锚在表头），一并计入但不算数据
+      /*
+       * 表头行挂的图（浮动图常被锚在表头）**不计入 mediaCount**。
+       *
+       * 它不会被导入（数据行从表头下一行开始），但之前被算进"识别到 N 个附件"，
+       * 于是界面上显示的数量和实际导入的数量对不上 —— 用户就会觉得"有的图消失了"。
+       * 这里单独统计，最后给一条明确提示。
+       */
       const headerMedia = mediaByCell.get(cellKey(headerRowIndex, c))
-      if (headerMedia) mediaCount += headerMedia.length
+      if (headerMedia?.length) {
+        headerMediaSkipped += headerMedia.length
+        headerMediaCols.add(headers[c] || colLetter(c))
+      }
 
       if (opts.dropEmptyColumns !== false && nonEmpty.length === 0 && mediaCount === 0) continue
 
@@ -524,6 +579,14 @@ export async function parseWorkbookFile(file: File, opts: ParseOptions = {}): Pr
         targetFieldType: inferred,
         typeTouched: false,
       })
+    }
+
+    if (headerMediaSkipped > 0) {
+      const cols = [...headerMediaCols].slice(0, 3).join('、')
+      warnings.push(
+        `「${name}」的表头行挂着 ${headerMediaSkipped} 张图片（${cols}${headerMediaCols.size > 3 ? ' 等' : ''}）。` +
+          `表头不是数据行，这些图片不会被导入 —— 这是"识别到的数量比导入后多"的常见原因。`,
+      )
     }
 
     const dataRowCount = dataRows.filter((row) => row.some((v) => rawToText(v).trim() !== '')).length
