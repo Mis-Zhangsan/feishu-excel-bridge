@@ -88,7 +88,9 @@ export default function ImportPanel({ tables, reloadTables }: Props) {
 
   const clearLogs = useCallback(() => {
     logsRef.current = []
-    clearLogs()
+    // 注意：这里必须是 setLogs([])。曾经被批量替换成 clearLogs() 导致无限递归，
+    // 一调用就栈溢出，表现是"选文件后完全没反应"。
+    setLogs([])
   }, [])
   const [result, setResult] = useState<ImportResult | null>(null)
   const [error, setError] = useState('')
