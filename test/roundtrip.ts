@@ -558,6 +558,17 @@ function checkNumberAndSplit() {
     looseOptionKey('泵头坏了， 挤不出料体') === looseOptionKey('泵头坏了，挤不出料体'),
     'looseOptionKey 忽略空格差异',
   )
+  /*
+   * ⚠️ 大小写必须敏感：`ABC` 和 `abc`、`A` 和 `a` 是业务上完全不同的选项。
+   * 早前这里多写了 toLowerCase()，会把两组本应独立的选项判成同一个，
+   * 导致其中一个写不进去。
+   */
+  ok(looseOptionKey('ABC') !== looseOptionKey('abc'), '大小写不同 = 不同选项（ABC ≠ abc）', {
+    a: looseOptionKey('ABC'),
+    b: looseOptionKey('abc'),
+  })
+  ok(looseOptionKey('A') !== looseOptionKey('a'), '大小写不同 = 不同选项（A ≠ a）')
+  ok(looseOptionKey('SPF 48') === looseOptionKey('SPF48'), '只忽略空白，不忽略大小写')
   const wsOpts = new Map<string, string>()
   wsOpts.set('泵头坏了，挤不出料体', 'opt_1')
   const wsHit = toBitableValue(FT.SingleSelect, '泵头坏了， 挤不出料体', {
