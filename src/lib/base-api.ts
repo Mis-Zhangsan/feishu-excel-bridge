@@ -162,14 +162,17 @@ export async function preAddOptions(
 
   const wanted = values.slice(0, 200)
   /*
-   * ⚠️ 这里**不做预过滤**。
-   *
-   * 早前用 isOptionNameSafe 先把"含换行/超长"的值筛掉，理由是"肯定建不出来"。
-   * 但那是猜的 —— 实测发现飞书其实能接受一部分含换行的选项名，
-   * 结果就是这些值白白被跳过、单元格留空。正确做法是**先全部尝试**，
-   * 失败的那些再由调用方处理（降级为文本 / 报错）。
+   * 判断"是否已存在"必须**两种键都查**：
+   *   - 原样值（源表原值可能就是已有选项名）
+   *   - 归一化值（已有选项名可能是带换行的旧数据）
+   * 只查一种就会出现"明明有却判成没有"→ 重复新建。
+   * 飞书本身**不做选项去重**，重复建出来的会真的出现在下拉里。
    */
-  const missing = wanted.filter((v) => !map.has(v))
+  const missing = wanted.filter((v) => {
+    if (map.has(v)) return false
+    const c = normalizeOptionName(v) || v
+    return !map.has(c)
+  })
   // 全都已存在：不必再建，也不必再回读一次
   if (!missing.length) return map
 
@@ -249,7 +252,18 @@ export async function preAddOptions(
  * 读取单选/多选字段的选项 id 映射。
  * 关键：多维表格写单选/多选单元格时，值必须是 { id, text }；
  * 只传纯文本（或只有 text 没有 id）时接口不会报错，但单元格会保持空白。
+ *
+ * 同一个选项会以**两种键**放进 map：
+ *   - 原样的名字（trim 后）—— 写入单元格时用的是源表原值，靠它命中
+ *   - 归一化后的名字（删换行、压空格）—— 判断"是否已存在"时靠它命中
+ *
+ * 两套键必须同时存在。早前只放了原样名字，而判断缺失用的是归一化名，
+ * 于是「已有选项名带换行」时会被判成不存在、又建一个 —— 用户就会在下拉里
+ * 看到两个一模一样的选项（飞书本身不做选项去重）。
  */
+/** 已警告过重复选项的字段，避免同一字段刷屏 */
+const warnedDupFields = new Set<string>()
+
 export async function readOptionMap(
   table: AnyTable,
   fieldId: string,
@@ -263,10 +277,38 @@ export async function readOptionMap(
     if (typeof field?.getOptions !== 'function') return map
     const opts = await field.getOptions()
     if (!Array.isArray(opts)) return map
+    /** 归一化名 -> 出现次数，用来发现历史遗留的重复选项 */
+    const counts = new Map<string, number>()
     for (const o of opts) {
-      const name = String(o?.name ?? '').trim()
+      const raw = String(o?.name ?? '').trim()
       const id = String(o?.id ?? '')
-      if (name && id) map.set(name, id)
+      if (!raw || !id) continue
+      // 原样键：写入时用源表原值查
+      if (!map.has(raw)) map.set(raw, id)
+      // 归一化键：判断"是否已存在"时用
+      const norm = normalizeOptionName(raw)
+      if (norm) {
+        if (!map.has(norm)) map.set(norm, id)
+        counts.set(norm, (counts.get(norm) ?? 0) + 1)
+      }
+    }
+    /*
+     * 飞书**不做选项去重**，历史上重复建出来的会一直留在下拉里。
+     * 这里只做诊断提示（帮用户发现并手工清理），不自动删 —— 删选项会影响已有记录。
+     */
+    if (!warnedDupFields.has(fieldId)) {
+      const dups = [...counts].filter(([, n]) => n > 1)
+      if (dups.length) {
+        warnedDupFields.add(fieldId)
+        const sample = dups
+          .slice(0, 3)
+          .map(([name, n]) => `「${name}」×${n}`)
+          .join('、')
+        console.warn(
+          `[excel-bridge] 字段 ${fieldId} 已有 ${dups.length} 组重复选项：${sample}` +
+            `${dups.length > 3 ? ' 等' : ''}。飞书不会自动去重，请在字段设置里手工清理。`,
+        )
+      }
     }
   } catch {
     /* 忽略 */
