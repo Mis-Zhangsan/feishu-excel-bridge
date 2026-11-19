@@ -1,5 +1,5 @@
 import { bitable } from '@lark-base-open/js-sdk'
-import { FT, normalizeOptionName } from './field-meta'
+import { FT, looseOptionKey, normalizeOptionName } from './field-meta'
 import type { FieldBrief, TableBrief } from './types'
 
 /** SDK 版本间类型名有差异，这里统一按结构化数据用，避免被类型定义绑死 */
@@ -169,9 +169,12 @@ export async function preAddOptions(
    * 飞书本身**不做选项去重**，重复建出来的会真的出现在下拉里。
    */
   const missing = wanted.filter((v) => {
+    // 三级比对：精确 → 归一化 → 忽略空白
     if (map.has(v)) return false
-    const c = normalizeOptionName(v) || v
-    return !map.has(c)
+    const norm = normalizeOptionName(v) || v
+    if (map.has(norm)) return false
+    const loose = looseOptionKey(v)
+    return !loose || !map.has(loose)
   })
   // 全都已存在：不必再建，也不必再回读一次
   if (!missing.length) return map
@@ -283,14 +286,16 @@ export async function readOptionMap(
       const raw = String(o?.name ?? '').trim()
       const id = String(o?.id ?? '')
       if (!raw || !id) continue
-      // 原样键：写入时用源表原值查
+      // 1. 原样键：写入时用源表原值查
       if (!map.has(raw)) map.set(raw, id)
-      // 归一化键：判断"是否已存在"时用
+      // 2. 归一化键：删换行、压连续空格
       const norm = normalizeOptionName(raw)
-      if (norm) {
-        if (!map.has(norm)) map.set(norm, id)
-        counts.set(norm, (counts.get(norm) ?? 0) + 1)
-      }
+      if (norm && !map.has(norm)) map.set(norm, id)
+      // 3. 忽略空白的键：处理「， 挤不出」vs「，挤不出」这类只差一个空格的写法
+      const loose = looseOptionKey(raw)
+      if (loose && !map.has(loose)) map.set(loose, id)
+
+      if (norm) counts.set(norm, (counts.get(norm) ?? 0) + 1)
     }
     /*
      * 飞书**不做选项去重**，历史上重复建出来的会一直留在下拉里。

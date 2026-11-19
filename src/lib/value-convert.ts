@@ -1,4 +1,4 @@
-import { FT, extOf, mimeOfName } from './field-meta'
+import { FT, extOf, looseOptionKey, mimeOfName, normalizeOptionName } from './field-meta'
 import { formatDate, parseBool, parseDateMs, parseNumber, rawToText, splitMulti } from './infer'
 import type { CellRaw, MediaRef } from './types'
 
@@ -132,8 +132,27 @@ function selectValue(
   options?: Map<string, string>,
 ): { id: string; text: string } | null {
   if (!options) return null
-  const id = options.get(text)
-  return id ? { id, text } : null
+  /*
+   * 三级比对，和 readOptionMap 里放进去的三种键一一对应：
+   *   1. 精确（源表原值恰好等于选项名）
+   *   2. 归一化（删换行、压连续空格）
+   *   3. 忽略所有空白（处理「， 挤不出」vs「，挤不出」差一个空格的情况）
+   *
+   * 少任何一级都会出现"目标表明明有、却判成没有"——
+   * 结果是单元格空白，或者重复建一个几乎一样的选项。
+   */
+  const hit = options.get(text)
+  if (hit) return { id: hit, text }
+
+  const norm = normalizeOptionName(text)
+  const byNorm = options.get(norm)
+  if (byNorm) return { id: byNorm, text }
+
+  const loose = looseOptionKey(text)
+  const byLoose = loose ? options.get(loose) : undefined
+  if (byLoose) return { id: byLoose, text }
+
+  return null
 }
 
 /** 反向：多维表格单元格 -> 写入 Excel 的文本/数字 */

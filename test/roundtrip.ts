@@ -10,7 +10,7 @@ import { buildXlsxBytes } from '../src/lib/excel-write'
 import type { OutSheet } from '../src/lib/excel-write'
 import { parseWorkbookFile, extractDispImgId, isDateFormat } from '../src/lib/excel-read'
 import { excelSerialToMs, formatDate, parseNumber, splitMulti } from '../src/lib/infer'
-import { FT, OPTION_NAME_MAX_LEN, isOptionNameSafe, normalizeOptionName } from '../src/lib/field-meta'
+import { FT, OPTION_NAME_MAX_LEN, isOptionNameSafe, looseOptionKey, normalizeOptionName } from '../src/lib/field-meta'
 import { cellKey } from '../src/lib/types'
 import { bitableValueToExcel, toBitableValue } from '../src/lib/value-convert'
 
@@ -547,6 +547,26 @@ function checkNumberAndSplit() {
   ok(normalizeOptionName('A\r\nB') === 'AB', 'CRLF 同样处理')
   ok(normalizeOptionName('  正常文本  ') === '正常文本', '首尾空白去掉')
   ok(normalizeOptionName('正常文本') === '正常文本', '没有换行的值保持原样')
+
+  /* ---- 三级比对：差一个空格也要能匹配上 ---- */
+  /*
+   * 真实场景：目标表里是「泵头坏了，挤不出料体」（无空格），
+   * 源表是「泵头坏了， 挤不出料体」（逗号后有空格）。
+   * 只做 trim / 压缩连续空格匹配不上，会判成"不存在"→ 要么重复建，要么写空。
+   */
+  ok(
+    looseOptionKey('泵头坏了， 挤不出料体') === looseOptionKey('泵头坏了，挤不出料体'),
+    'looseOptionKey 忽略空格差异',
+  )
+  const wsOpts = new Map<string, string>()
+  wsOpts.set('泵头坏了，挤不出料体', 'opt_1')
+  const wsHit = toBitableValue(FT.SingleSelect, '泵头坏了， 挤不出料体', {
+    media: [],
+    options: wsOpts,
+  })
+  ok(wsHit.ok && (wsHit.value as { id: string }).id === 'opt_1', '写入时差一个空格也能命中已有选项', {
+    got: wsHit.ok ? wsHit.value : wsHit.reason,
+  })
 
   /* ---- 日期格式识别 ---- */
   ok(isDateFormat('yyyy-mm-dd') === true, '「yyyy-mm-dd」识别为日期')
