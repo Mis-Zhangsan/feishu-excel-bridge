@@ -20,6 +20,19 @@ export function formatDuration(sec: number): string {
   return m > 0 ? `${m} 分 ${s % 60} 秒` : `${s} 秒`
 }
 
+/**
+ * 紧凑时长：`3:46` / `1:05:20`。
+ * 用于底部状态栏这种横向空间紧张的地方 —— 「3 分 46 秒」在窄侧栏里会被截断。
+ */
+export function formatDurationShort(sec: number): string {
+  const s = Math.max(0, Math.floor(sec))
+  const h = Math.floor(s / 3600)
+  const m = Math.floor((s % 3600) / 60)
+  const r = s % 60
+  const two = (n: number) => String(n).padStart(2, '0')
+  return h > 0 ? `${h}:${two(m)}:${two(r)}` : `${m}:${two(r)}`
+}
+
 /** 复制文本；剪贴板被沙箱拒绝时退化为 execCommand */
 export async function copyText(text: string): Promise<boolean> {
   try {

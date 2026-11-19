@@ -94,7 +94,42 @@ function detectSpareFields(fields: FieldBrief[]): FieldBrief[] {
   return fields.filter((f) => f.type === FT.Text && DEFAULT_NAMES.test((f.name || '').trim()))
 }
 
-/** 收集某一列在单选/多选场景下需要用到的全部选项文本 */
+/**
+ * 找出这一列里**不适合作为选项名**的值，并带上 Excel 行号。
+ *
+ * 只说"有 3 个值有问题"用户没法核对；要能直接跳到那一行去改。
+ * 行号用 `r + 1`：matrix 是 0-based 且含表头，所以 +1 就是 Excel 里看到的行号。
+ */
+function findUnsafeOptionValues(
+  sheet: SourceSheet,
+  col: SourceColumn,
+  type: number,
+): { row: number; text: string }[] {
+  const out: { row: number; text: string }[] = []
+  for (const r of dataRowIndexes(sheet)) {
+    const raw = sheet.matrix[r]?.[col.col] ?? null
+    const t = rawToText(raw).trim()
+    if (!t) continue
+    const parts =
+      type === FT.SingleSelect ? [t] : t.split(/[,，;；、]/).map((x) => x.trim()).filter(Boolean)
+    for (const p of parts) {
+      if (p && !isOptionNameSafe(p)) out.push({ row: r + 1, text: p })
+    }
+  }
+  return out
+}
+
+/** 把问题值压缩成一句可读的提示（最多列 5 处） */
+function describeBadOptions(bad: { row: number; text: string }[]): string {
+  const shown = bad.slice(0, 5).map((b) => {
+    const t = b.text.length > 16 ? `${b.text.slice(0, 16)}…` : b.text
+    return `第 ${b.row} 行「${t}」`
+  })
+  return `${shown.join('、')}${bad.length > 5 ? ` 等 ${bad.length} 处` : ''}`
+}
+
+/**
+ * 收集某一列在单选/多选场景下需要用到的全部选项文本 */
 function collectSelectValues(sheet: SourceSheet, col: SourceColumn, type: number): string[] {
   const distinct = new Set<string>()
   for (const r of dataRowIndexes(sheet)) {
@@ -274,7 +309,17 @@ export async function runImport(sheets: SourceSheet[], opts: ImportOptions): Pro
     }
 
     const sheetLabel = `数据表 ${sheets.indexOf(sheet) + 1}/${sheets.length}：${sheet.name}`
-    report('fields', '正在准备数据表', si, sheets.length, sheetLabel)
+    /*
+     * 字段级明细：让「创建数据表与字段」这一行能展开，看到每个字段的处理状态。
+     * 之前这个阶段只有一句「正在准备数据表」，用户完全不知道卡在哪个字段上 ——
+     * 而字段阶段恰恰是最慢的一段（每个单选列都要补建选项）。
+     */
+    const fieldItems: StageItem[] = enabled.map((c) => ({
+      label: c.targetFieldName?.trim() || c.header,
+      meta: fieldTypeLabel(c.targetFieldType),
+      state: 'pending' as const,
+    }))
+    report('fields', '正在准备数据表', 0, enabled.length, sheetLabel, fieldItems)
 
     let tableId = ''
     let tableName = sheet.importTableName || sheet.name
@@ -365,7 +410,17 @@ export async function runImport(sheets: SourceSheet[], opts: ImportOptions): Pro
       return spare.id
     }
 
-    for (const col of enabled) {
+    for (let ci = 0; ci < enabled.length; ci++) {
+      const col = enabled[ci]
+      /*
+       * 更新字段明细：上一个标记完成、当前标记进行中，并刷一次到界面。
+       * 这样「创建数据表与字段」展开后能看出正在处理哪个字段 —— 字段阶段是最慢的一段。
+       */
+      if (ci > 0 && fieldItems[ci - 1]) fieldItems[ci - 1].state = 'done'
+      if (fieldItems[ci]) {
+        fieldItems[ci].state = 'active'
+        report('fields', `正在处理「${col.header}」`, ci, enabled.length, undefined, fieldItems)
+      }
       // a) 映射到已有字段
       if (col.targetFieldId) {
         const meta = existing.find((f) => f.id === col.targetFieldId)
@@ -390,12 +445,13 @@ export async function runImport(sheets: SourceSheet[], opts: ImportOptions): Pro
              */
             const vals = collectSelectValues(sheet, col, meta.type)
             const safe = vals.filter((v) => isOptionNameSafe(v))
-            const badCount = vals.length - safe.length
-            if (badCount > 0) {
+            // 精确到行：只报数量用户没法核对，得能直接跳到那一行
+            const bad = findUnsafeOptionValues(sheet, col, meta.type)
+            if (bad.length > 0) {
               warnings.push(
-                `「${sheet.name}」的字段「${col.header}」有 ${badCount} 个值含换行或超过 ${OPTION_NAME_MAX_LEN} 字，` +
-                  `无法作为${fieldTypeLabel(meta.type)}选项，这些单元格会为空。` +
-                  `建议把目标字段改成「多行文本」后重新导入。`,
+                `「${sheet.name}」的字段「${col.header}」有 ${bad.length} 处值无法作为${fieldTypeLabel(meta.type)}选项` +
+                  `（含换行或超过 ${OPTION_NAME_MAX_LEN} 字）：${describeBadOptions(bad)}。` +
+                  `这些单元格会为空；建议把目标字段改成「多行文本」后重新导入。`,
               )
             }
             let map = optionMaps.get(meta.id)
@@ -439,12 +495,12 @@ export async function runImport(sheets: SourceSheet[], opts: ImportOptions): Pro
           // 同「手动映射」分支：追加时必须补建选项，否则新值全部写不进去
           const vals = collectSelectValues(sheet, col, sameName.type)
           const safe = vals.filter((v) => isOptionNameSafe(v))
-          const badCount = vals.length - safe.length
-          if (badCount > 0) {
+          const bad = findUnsafeOptionValues(sheet, col, sameName.type)
+          if (bad.length > 0) {
             warnings.push(
-              `「${sheet.name}」的字段「${col.header}」有 ${badCount} 个值含换行或超过 ${OPTION_NAME_MAX_LEN} 字，` +
-                `无法作为${fieldTypeLabel(sameName.type)}选项，这些单元格会为空。` +
-                `建议把该字段改成「多行文本」后重新导入。`,
+              `「${sheet.name}」的字段「${col.header}」有 ${bad.length} 处值无法作为${fieldTypeLabel(sameName.type)}选项` +
+                `（含换行或超过 ${OPTION_NAME_MAX_LEN} 字）：${describeBadOptions(bad)}。` +
+                `这些单元格会为空；建议把该字段改成「多行文本」后重新导入。`,
             )
           }
           let map = optionMaps.get(sameName.id)
@@ -472,12 +528,13 @@ export async function runImport(sheets: SourceSheet[], opts: ImportOptions): Pro
        */
       if (effectiveType === FT.SingleSelect || effectiveType === FT.MultiSelect) {
         const vals = collectSelectValues(sheet, col, effectiveType)
-        const badCount = vals.filter((v) => !isOptionNameSafe(v)).length
-        if (badCount > 0) {
+        const bad = findUnsafeOptionValues(sheet, col, effectiveType)
+        if (bad.length > 0) {
           effectiveType = FT.Text
           warnings.push(
-            `「${sheet.name}」的字段「${col.header}」有 ${badCount} 个值含换行或超过 ${OPTION_NAME_MAX_LEN} 字，` +
-              `不适合作为选项（飞书建选项会失败，且失败后单元格会静默变空）。已改用「多行文本」完整保留内容。`,
+            `「${sheet.name}」的字段「${col.header}」有 ${bad.length} 处值含换行或超过 ${OPTION_NAME_MAX_LEN} 字` +
+              `（${describeBadOptions(bad)}），不适合作为选项（飞书建选项会失败，且失败后单元格会静默变空）。` +
+              `已改用「多行文本」完整保留内容。`,
           )
         }
       }

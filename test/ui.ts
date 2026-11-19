@@ -65,7 +65,9 @@ async function main() {
   const { default: App } = await import('../src/App')
   const { default: ImportPanel } = await import('../src/components/ImportPanel')
   const { default: ExportPanel } = await import('../src/components/ExportPanel')
-  const { Steps, RingProgress, CompletionCard, Card } = await import('../src/components/ui')
+  const { Steps, RingProgress, CompletionCard, Card, formatDurationShort } = await import(
+    '../src/components/ui'
+  )
   const { IMPORTABLE_FILE_TYPES } = await import('../src/lib/field-meta')
 
   const host = document.getElementById('root')!
@@ -491,6 +493,59 @@ async function main() {
     /写入到/.test(mergeHead) && !!host.querySelector('.tk-matched'),
     '追加模式下按字段名自动接上（无需手动选）',
   )
+
+  /* ---- 弹层语义：已有字段不能改类型 ---- */
+  /*
+   * 追加模式下点开「写入到」时，如果目标是**已有字段**，
+   * 不能再给出类型列表 —— 那里改的是 targetFieldType（只影响"新建时用什么类型"），
+   * 写入仍按目标字段的类型走，用户会以为改了实际没改。
+   * 只有「新建字段」才显示名称输入框和类型列表。
+   */
+  await act(async () => {
+    root.render(
+      createElement(MappingEditor, {
+        sheets: [
+          {
+            ...sheetFixture,
+            importMode: 'append' as const,
+            importTableId: 'tbl_merge',
+            columns: [
+              // 已绑定已有字段
+              { ...col(0, '甲', true), targetFieldId: 'f_a', targetFieldName: '甲', targetFieldType: 1 },
+            ],
+          },
+        ],
+        tables: [{ id: 'tbl_merge', name: '目标表' }],
+        onChange: () => {},
+        onLoadFields: async () => [{ id: 'f_a', name: '甲', type: 1 }],
+      }),
+    )
+  })
+  // 打开弹层（linkedom 没有 MouseEvent，直接用元素自带的 click）
+  const trigger = host.querySelector('.tk-matched') as HTMLButtonElement | null
+  if (trigger) {
+    await act(async () => {
+      trigger.click()
+    })
+  }
+  const popText = document.body.textContent ?? ''
+  ok(/写入到/.test(popText), '弹层里有「写入到」')
+  ok(!/新字段类型/.test(popText), '已绑定已有字段时不显示「新字段类型」')
+  ok(!/新字段名称/.test(popText), '已绑定已有字段时不显示「新字段名称」')
+
+  /* ---- 紧凑时长格式 ---- */
+  ok(formatDurationShort(0) === '0:00', 'formatDurationShort(0) → 0:00', {
+    got: formatDurationShort(0),
+  })
+  ok(formatDurationShort(65) === '1:05', 'formatDurationShort(65) → 1:05', {
+    got: formatDurationShort(65),
+  })
+  ok(formatDurationShort(226) === '3:46', 'formatDurationShort(226) → 3:46（不再被截断）', {
+    got: formatDurationShort(226),
+  })
+  ok(formatDurationShort(3725) === '1:02:05', '超过 1 小时带小时位', {
+    got: formatDurationShort(3725),
+  })
 
   /* ============ 9. 附件上传：超时保护与逐个兜底 ============ */
   console.log('\n=== 9. 附件上传的容错 ===')

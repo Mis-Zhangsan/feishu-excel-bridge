@@ -128,7 +128,18 @@ export function orphanFields(fields: FieldBrief[], keepIds: Set<string>): FieldB
   return fields.filter((f) => !keepIds.has(f.id))
 }
 
-/** 单选/多选：把取值补成选项，失败不阻塞。返回「选项名 -> 选项 id」映射 */
+/**
+ * 单选/多选：把取值补成选项，失败不阻塞。返回「选项名 -> 选项 id」映射。
+ *
+ * 性能上有两处必须做对，否则追加导入会慢到分钟级：
+ *
+ * 1. **先读已有选项，只补缺的**。
+ *    早前是无条件把整列所有唯一值重新 addOption 一遍 —— 哪怕目标表里早就有，
+ *    每个值都是一次失败的 API 往返。277 行的表光这一步就能拖掉几分钟。
+ *
+ * 2. **有限并发**。addOption 是单条接口，几十上百个值串行发实在太慢；
+ *    每批 4 个并发既明显提速，又不至于把服务端惹到限流。
+ */
 export async function preAddOptions(
   table: AnyTable,
   fieldId: string,
@@ -137,28 +148,39 @@ export async function preAddOptions(
 ): Promise<Map<string, string>> {
   const map = new Map<string, string>()
   if (!values.length) return map
+
+  let field: any
   try {
-    const field: any = await table.getField(fieldId)
-    if (typeof field?.addOption !== 'function') {
-      /*
-       * 这个 SDK 实现没有 addOption —— 至少把**已有选项**读出来。
-       * 早前直接 return 空表，调用方看到的 Map.size === 0，
-       * 会误以为"没有选项信息"从而退回纯文本写单选 → 单元格静默空白。
-       */
-      return await readOptionMap(table, fieldId, map)
-    }
-    for (const v of values.slice(0, 200)) {
-      try {
-        await field.addOption(v)
-      } catch {
-        /* 选项已存在 / 非法值，忽略 */
-      }
-    }
+    field = await table.getField(fieldId)
   } catch {
-    /* 忽略 */
+    return await readOptionMap(table, fieldId, map, field)
   }
+
+  // 先拿到已有选项（这一步同时填好 map）
+  await readOptionMap(table, fieldId, map, field)
+  if (typeof field?.addOption !== 'function') return map
+
+  const wanted = values.slice(0, 200)
+  const missing = wanted.filter((v) => !map.has(v))
+  // 全都已存在：不必再建，也不必再回读一次
+  if (!missing.length) return map
+
+  const CONCURRENCY = 4
+  for (let i = 0; i < missing.length; i += CONCURRENCY) {
+    const slice = missing.slice(i, i + CONCURRENCY)
+    await Promise.allSettled(
+      slice.map(async (v) => {
+        try {
+          await field.addOption(v)
+        } catch {
+          /* 选项已存在 / 非法值，忽略 */
+        }
+      }),
+    )
+  }
+
   // 建完再回读一次，拿到真实的选项 id —— 写单元格必须用 id，用文本会被静默丢弃
-  return await readOptionMap(table, fieldId, map)
+  return await readOptionMap(table, fieldId, map, field)
 }
 
 /**
@@ -170,10 +192,12 @@ export async function readOptionMap(
   table: AnyTable,
   fieldId: string,
   into?: Map<string, string>,
+  /** 已经拿到的 field 对象；传了就省掉一次 getField（调用方常常刚拿过） */
+  fieldObj?: unknown,
 ): Promise<Map<string, string>> {
   const map = into ?? new Map<string, string>()
   try {
-    const field: any = await table.getField(fieldId)
+    const field: any = fieldObj ?? (await table.getField(fieldId))
     if (typeof field?.getOptions !== 'function') return map
     const opts = await field.getOptions()
     if (!Array.isArray(opts)) return map

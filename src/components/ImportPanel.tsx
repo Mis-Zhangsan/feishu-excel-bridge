@@ -9,6 +9,7 @@ import {
   Tip,
   formatBytes,
   formatDuration,
+  formatDurationShort,
   useSinceUpdate,
 } from './ui'
 import type { ProgressStageDef } from './ui'
@@ -266,7 +267,22 @@ export default function ImportPanel({ tables, reloadTables }: Props) {
         items: onMedia ? progress?.items : undefined,
       })
     }
-    list.push({ key: 'fields', label: '创建数据表与字段' }, { key: 'records', label: '写入记录' })
+    const onFields = progress?.stage === 'fields'
+    list.push({
+      key: 'fields',
+      label: '创建数据表与字段',
+      summary:
+        onFields && progress && progress.total > 1 ? `${progress.done} / ${progress.total}` : undefined,
+      items: onFields ? progress?.items : undefined,
+    })
+    const onRecords = progress?.stage === 'records'
+    list.push({
+      key: 'records',
+      label: '写入记录',
+      summary:
+        onRecords && progress && progress.total > 1 ? `${progress.done} / ${progress.total}` : undefined,
+      items: onRecords ? progress?.items : undefined,
+    })
     return list
   })()
 
@@ -299,10 +315,14 @@ export default function ImportPanel({ tables, reloadTables }: Props) {
           currentStage={progress?.stage}
         />
         <div className="footer-bar">
+          {/*
+           * 文案要短：底部是固定高度，之前「导入中 · 已用时 3 分 46 秒 · 当前步骤 3 分 46 秒（仍在处理…」
+           * 会被 ellipsis 截掉最关键的后半句。这里改成 mm:ss，并把"仍在处理"换成进度环上的动效。
+           */}
           <span className={waiting >= 60 ? 'muted wait-slow' : 'muted'}>
-            导入中 · 已用时 {formatDuration(elapsed)}
-            {waiting >= 8 ? ` · 当前步骤 ${formatDuration(waiting)}` : ''}
-            {waiting >= 60 ? '（仍在处理）' : ''}
+            已用 {formatDurationShort(elapsed)}
+            {waiting >= 8 ? ` · 本步 ${formatDurationShort(waiting)}` : ''}
+            {waiting >= 60 ? ' · 较慢' : ''}
           </span>
           <span className="footer-actions">
             <button

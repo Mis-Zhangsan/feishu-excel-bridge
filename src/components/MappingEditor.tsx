@@ -432,32 +432,81 @@ export default function MappingEditor({ sheets, tables, onChange, onLoadFields }
                                     ))}
                                   </select>
                                 </span>
-                                <span className="tk-sec">新字段的类型</span>
+
+                                {/*
+                                 * 只有「新建字段」才显示名称和类型。
+                                 *
+                                 * 写入已有字段时，类型和目标字段名都由那个字段决定 ——
+                                 * 在这里给出类型列表会让人以为能改，实际改的是
+                                 * `targetFieldType`（只影响"新建时用什么类型"），
+                                 * 写入时仍然按目标字段的类型走。这是误导。
+                                 */}
+                                {!col.targetFieldId && (
+                                  <>
+                                    <span className="tk-sec">新字段名称</span>
+                                    <span className="tk-target">
+                                      <input
+                                        className="input"
+                                        value={col.targetFieldName}
+                                        placeholder={col.header}
+                                        aria-label="新字段名称"
+                                        onChange={(e) =>
+                                          updateColumn(sheet.name, col.key, {
+                                            targetFieldName: e.target.value,
+                                            mappingTouched: true,
+                                          })
+                                        }
+                                      />
+                                    </span>
+                                    <span className="tk-sec">新字段类型</span>
+                                  </>
+                                )}
                               </>
                             )}
-                            {IMPORTABLE_TYPES.map((t) => (
-                              <button
-                                key={t.value}
-                                type="button"
-                                role="option"
-                                aria-selected={t.value === col.targetFieldType}
-                                className={`tk-item${t.value === col.targetFieldType ? ' on' : ''}`}
-                                onClick={() => {
-                                  updateColumn(sheet.name, col.key, {
-                                    targetFieldType: t.value,
-                                    inferredType: t.value,
-                                    typeTouched: true,
-                                  })
-                                  close()
-                                }}
-                              >
-                                <span className={`tk tk-${fieldTypeTone(t.value)}`}>
-                                  <i className="tk-dot" />
-                                  {t.label}
+                            {/* 新建表模式：没有目标表字段可绑，名称和类型都可以改 */}
+                            {!appendMode && (
+                              <>
+                                <span className="tk-sec">字段名称</span>
+                                <span className="tk-target">
+                                  <input
+                                    className="input"
+                                    value={col.targetFieldName}
+                                    placeholder={col.header}
+                                    aria-label="字段名称"
+                                    onChange={(e) =>
+                                      updateColumn(sheet.name, col.key, {
+                                        targetFieldName: e.target.value,
+                                      })
+                                    }
+                                  />
                                 </span>
-                                {t.value === col.targetFieldType && <span className="tk-check">✓</span>}
-                              </button>
-                            ))}
+                                <span className="tk-sec">字段类型</span>
+                              </>
+                            )}
+                            {( !appendMode || !col.targetFieldId ) &&
+                              IMPORTABLE_TYPES.map((t) => (
+                                <button
+                                  key={t.value}
+                                  type="button"
+                                  role="option"
+                                  aria-selected={t.value === col.targetFieldType}
+                                  className={`tk-item${t.value === col.targetFieldType ? ' on' : ''}`}
+                                  onClick={() => {
+                                    updateColumn(sheet.name, col.key, {
+                                      targetFieldType: t.value,
+                                      inferredType: t.value,
+                                      typeTouched: true,
+                                    })
+                                    close()
+                                  }}
+                                >
+                                  <span className={`tk tk-${fieldTypeTone(t.value)}`}>
+                                    <i className="tk-dot" />
+                                    {t.label}
+                                  </span>
+                                  {t.value === col.targetFieldType && <span className="tk-check">✓</span>}
+                                </button>
+                              ))}
                           </span>
                         )}
                       </Popover>
