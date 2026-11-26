@@ -350,12 +350,17 @@ body {
 /* ------------------------------ 分段控件 ------------------------------ */
 
 .segmented {
-  display: inline-flex;
+  /*
+   * 等分铺满而不是 inline-flex：
+   * 侧栏只有 400px，`inline-flex` 会让几项挤成一串文字，看不出是按钮组。
+   */
+  display: flex;
+  width: 100%;
   padding: 3px;
   gap: 3px;
   background: var(--surface-3);
   border: 0;
-  border-radius: var(--radius-sm);
+  border-radius: 10px;
 }
 
 .segmented.disabled {
@@ -373,12 +378,14 @@ body {
 
 .seg {
   display: inline-flex;
+  flex: 1;
   align-items: center;
   justify-content: center;
   gap: 6px;
-  padding: 7px 11px;
+  min-width: 0;
+  padding: 8px 10px;
   border: none;
-  border-radius: var(--radius-xs);
+  border-radius: 7px;
   background: transparent;
   color: var(--text-2);
   font-family: inherit;
@@ -394,12 +401,19 @@ body {
   background: rgba(255, 255, 255, 0.7);
 }
 
-/* 选中态：白底浮起（分段控件的经典做法） */
+/*
+ * 选中态：白底 + 主色文字 + 细主色描边。
+ *
+ * 原来只有 `box-shadow: 0 1px 3px` —— 白底浮在浅灰上几乎看不出边界，
+ * 截图里就是"一行文字"，用户根本分不清哪个是选中的。
+ */
 .seg.active {
-  background: var(--surface);
-  color: var(--text);
+  background: #fff;
+  color: var(--accent-ink);
   font-weight: 600;
-  box-shadow: 0 1px 3px rgba(15, 23, 42, 0.1);
+  box-shadow:
+    0 1px 3px rgba(15, 23, 42, 0.1),
+    inset 0 0 0 1px var(--accent-soft);
 }
 
 .seg-icon {

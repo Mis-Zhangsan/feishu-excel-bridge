@@ -1,6 +1,6 @@
 import JSZip from 'jszip'
 import { FT, isImageMime } from './field-meta'
-import { fetchAllRecords, getAttachmentUrls, getTable, orderedFields, withTimeout } from './base-api'
+import { fetchAllRecords, getActiveViewId, getAttachmentUrls, getTable, orderedFields, withTimeout } from './base-api'
 import { bitableValueToExcel, extractAttachments, guessExtFromMime } from './value-convert'
 import { formatDate } from './infer'
 import { buildAttachmentStem, cellToPlainText, dedupePath, pickExtension, sanitizeName } from './filename'
@@ -198,7 +198,8 @@ export async function runAttachmentExport(opts: AttachmentExportOptions): Promis
     done: number,
     total: number,
     detail?: string,
-  ) => opts.onProgress?.({ stage, phase, done, total, detail })
+    items?: StageItem[],
+  ) => opts.onProgress?.({ stage, phase, done, total, detail, items })
 
   const tableIds = opts.tableIds.filter(Boolean)
   if (!tableIds.length) throw new Error('请至少选择一个数据表')
@@ -213,6 +214,10 @@ export async function runAttachmentExport(opts: AttachmentExportOptions): Promis
   let totalBytes = 0
   let skippedBig = 0
 
+  /** 先收集所有待下载的附件（含已分配好的 zip 内路径） */
+  type DlTask = { url: string; path: string; label: string; size: number }
+  const dlTasks: DlTask[] = []
+
   for (let ti = 0; ti < tableIds.length; ti++) {
     const table = await getTable(tableIds[ti])
     let tableName = `数据表${ti + 1}`
@@ -224,7 +229,18 @@ export async function runAttachmentExport(opts: AttachmentExportOptions): Promis
     report('read', `读取 ${ti + 1}/${tableIds.length}`, ti, tableIds.length, tableName)
 
     const fields = await orderedFields(table)
-    const records = await fetchAllRecords(table)
+    /*
+     * 按**当前视图**取记录 —— 行号才能和用户在界面上看到的一致。
+     *
+     * 不指定视图时拿到的是整表记录，顺序由默认视图/内部排序决定，
+     * 和用户眼前看到的行序可能不同：他看到的第 1 行可能对应 records[2]，
+     * 于是导出的 `0001` 就变成了 `0003`。
+     */
+    const viewId = await getActiveViewId(table)
+    const records = await fetchAllRecords(table, viewId)
+    if (!viewId) {
+      warnings.push(`「${tableName}」取不到当前视图，已按整表顺序编号，可能与界面显示的行号不一致。`)
+    }
 
     // 只关心附件字段
     const attachFields = fields.filter((f) => f.type === FT.Attachment)
@@ -300,8 +316,6 @@ export async function runAttachmentExport(opts: AttachmentExportOptions): Promis
           continue
         }
 
-        // 记下这一格开始前的计数：全失败时 totalFiles 不会变，据此判断
-        const beforeCell = totalFiles
         for (let ai = 0; ai < atts.length; ai++) {
           const a = atts[ai]
           const mb = (a.size || 0) / 1024 / 1024
@@ -329,32 +343,20 @@ export async function runAttachmentExport(opts: AttachmentExportOptions): Promis
           const ext = pickExtension(a.name, a.type || '')
           const fullPath = dedupePath(`${folder}${stem}${ext}`, usedPaths)
 
-          try {
-            const resp = await withTimeout(
-              fetch(url, { signal: timeoutSignal(IMAGE_FETCH_TIMEOUT_MS) }),
-              IMAGE_FETCH_TIMEOUT_MS,
-              `${a.name || '附件'} 下载`,
-            )
-            if (!resp.ok) throw new Error(`HTTP ${resp.status}`)
-            const buf = await resp.arrayBuffer()
-            zip.file(fullPath, buf)
-            totalBytes += buf.byteLength
-            tableFiles++
-            totalFiles++
-          } catch (e) {
-            errors.push(`「${field.name}」第 ${ri + 1} 行的「${a.name || a.token}」下载失败：${String((e as Error)?.message ?? e)}`)
-          }
-        }
-
-        /*
-         * 这一格一个都没成功 → 明确提示。
-         * 判据用"计数没变"而不是"文件夹是否为空"：
-         * zip 里只有文件条目，空文件夹本来就不会存在，查它没有意义。
-         */
-        if (atts.length && totalFiles === beforeCell) {
-          warnings.push(
-            `「${tableName}」第 ${ri + 1} 行「${field.name}」有 ${atts.length} 个附件，但都没能导出。`,
-          )
+          /*
+           * 只**收集**任务，不在这里下载。
+           *
+           * 原来这里是 `await fetch(...)` —— 整个导出是严格串行的：
+           * 277 行 × 2 列 = 几百次网络往返一个接一个跑，这是导出慢的主因。
+           * 下载是只读 GET，并发是安全的（不像导入时的 addOption 写操作），
+           * 所以集中起来用 mapPool 并发跑。
+           */
+          dlTasks.push({
+            url,
+            path: fullPath,
+            label: `「${field.name}」第 ${ri + 1} 行 · ${a.name || a.token}`,
+            size: a.size || 0,
+          })
         }
       }
 
@@ -376,6 +378,49 @@ export async function runAttachmentExport(opts: AttachmentExportOptions): Promis
       records.length,
       `${tableName} · 完成 ${tableFiles} 个附件`,
     )
+  }
+
+  /*
+   * ---- 并发下载 ----
+   *
+   * 之前是「读一条记录 → 下一个文件 → 再下一条」，整批严格串行。
+   * 几百个附件就是几百次往返，几 MB 的表能跑好几分钟。
+   *
+   * 下载是只读 GET，可以安全并发（导入时的 addOption 是写操作，并发会互相冲突，
+   * 那是另一回事）。并发度取 6：比串行快数倍，又不至于把 CDN 惹到限流。
+   */
+  if (dlTasks.length) {
+    const DOWNLOAD_CONCURRENCY = 6
+    const items: StageItem[] = dlTasks.map((t) => ({
+      label: t.label,
+      meta: fmtSize(t.size),
+      state: 'pending',
+    }))
+    report('media', '下载附件', 0, dlTasks.length, `共 ${dlTasks.length} 个文件`, items)
+
+    let done = 0
+    await mapPool(dlTasks, DOWNLOAD_CONCURRENCY, async (t, i) => {
+      try {
+        const resp = await withTimeout(
+          fetch(t.url, { signal: timeoutSignal(IMAGE_FETCH_TIMEOUT_MS) }),
+          IMAGE_FETCH_TIMEOUT_MS,
+          `${t.label} 下载`,
+        )
+        if (!resp.ok) throw new Error(`HTTP ${resp.status}`)
+        const buf = await resp.arrayBuffer()
+        zip.file(t.path, buf)
+        totalBytes += buf.byteLength
+        totalFiles++
+        if (items[i]) items[i].state = 'done'
+      } catch (e) {
+        if (items[i]) items[i].state = 'fail'
+        errors.push(`${t.label} 下载失败：${String((e as Error)?.message ?? e)}`)
+      }
+      done++
+      if (done % 5 === 0 || done === dlTasks.length) {
+        report('media', '下载附件', done, dlTasks.length, undefined, items)
+      }
+    })
   }
 
   if (!totalFiles) {
@@ -894,61 +939,4 @@ export function triggerDownload(blob: Blob, fileName: string): void {
     document.body.removeChild(a)
     URL.revokeObjectURL(url)
   }, 2000)
-}
-
-/**
- * 尽量把浏览器下载目录里刚导出的文件「亮」出来。
- *
- * 插件的 iframe 是 `sandbox="allow-downloads"` 的受控环境，**没有文件系统访问权**，
- * 不存在「打开所在文件夹」这种 API。能做的是：
- *  1) 若宿主允许，用 File System Access API 把 blob 存到用户**自己挑选**的目录
- *     （`showSaveFilePicker` 会弹出系统的保存对话框，用户选定后系统会跳转到该目录）；
- *  2) 退化方案：再触发一次同名下载，浏览器下载栏会高亮该文件，
- *     同时在界面上告诉用户去「下载」文件夹找。
- *
- * 返回 'picked' 表示用户已在系统对话框里选定位置，'fallback' 表示退化为重新下载。
- */
-export type RevealOutcome = 'picked' | 'fallback' | 'cancelled'
-
-type FilePickerWindow = Window & {
-  showSaveFilePicker?: (opts: {
-    suggestedName?: string
-    types?: { description: string; accept: Record<string, string[]> }[]
-  }) => Promise<{
-    createWritable: () => Promise<{ write: (data: Blob) => Promise<void>; close: () => Promise<void> }>
-  }>
-}
-
-export async function revealExportFile(blob: Blob, fileName: string): Promise<RevealOutcome> {
-  const w = window as FilePickerWindow
-  if (typeof w.showSaveFilePicker === 'function') {
-    try {
-      // 拆分模式下产物是 zip，保存对话框要给出对应的类型与扩展名
-      const isZip = /\.zip$/i.test(fileName)
-      const handle = await w.showSaveFilePicker({
-        suggestedName: fileName,
-        types: [
-          isZip
-            ? { description: 'ZIP 压缩包', accept: { 'application/zip': ['.zip'] } }
-            : {
-                description: 'Excel 工作簿',
-                accept: {
-                  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': ['.xlsx'],
-                },
-              },
-        ],
-      })
-      const writable = await handle.createWritable()
-      await writable.write(blob)
-      await writable.close()
-      return 'picked'
-    } catch (e) {
-      // 用户手动取消 → 不算失败，什么都不做
-      const name = String((e as Error)?.name ?? '')
-      if (name === 'AbortError') return 'cancelled'
-      // 权限被沙箱拒绝 → 走退化路径
-    }
-  }
-  triggerDownload(blob, fileName)
-  return 'fallback'
 }

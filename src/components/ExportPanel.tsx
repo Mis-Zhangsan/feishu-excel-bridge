@@ -20,7 +20,7 @@ import {
   IconTable,
   IconWarn,
 } from './icons'
-import { buildExportLogLines, revealExportFile, runAttachmentExport, runExport, triggerDownload } from '../lib/exporter'
+import { buildExportLogLines, runAttachmentExport, runExport, triggerDownload } from '../lib/exporter'
 import { saveRunLog } from '../lib/diag-log'
 import type { AttachmentNamingMode, ExportMediaSession, ExportProgress, ExportResult, MediaFailure } from '../lib/exporter'
 import type { FieldBrief, TableBrief } from '../lib/types'
@@ -91,8 +91,6 @@ export default function ExportPanel({ tables, reloadTables }: Props) {
   const [progress, setProgress] = useState<ExportProgress | null>(null)
   const [result, setResult] = useState<ExportResult | null>(null)
   const [error, setError] = useState('')
-  const [locating, setLocating] = useState(false)
-  const [revealMsg, setRevealMsg] = useState<{ kind: 'info' | 'ok' | 'warn'; text: string } | null>(null)
   /** 图片下载有失败项时停在这里，等用户决定「逐张重试」还是「跳过」 */
   const [mediaReview, setMediaReview] = useState<{
     failures: MediaFailure[]
@@ -169,7 +167,6 @@ export default function ExportPanel({ tables, reloadTables }: Props) {
     setBusy(true)
     setError('')
     setResult(null)
-    setRevealMsg(null)
     setPhase('running')
     try {
       /*
@@ -266,26 +263,6 @@ export default function ExportPanel({ tables, reloadTables }: Props) {
     resolveRef.current = null
     setMediaReview(null)
     setPhase('running')
-  }
-
-  /** 「打开文件所在位置」：插件 iframe 没有文件系统权限，只能请用户挑目录或引导到下载文件夹 */
-  const doReveal = async () => {
-    if (!result) return
-    setLocating(true)
-    setRevealMsg(null)
-    try {
-      const outcome = await revealExportFile(result.blob, result.fileName)
-      if (outcome === 'picked') {
-        setRevealMsg({ kind: 'ok', text: `已保存为「${result.fileName}」，系统已跳转到你选定的文件夹。` })
-      } else if (outcome === 'fallback') {
-        setRevealMsg({
-          kind: 'info',
-          text: `插件运行在受限的 iframe 里，无法直接打开系统文件夹。已为你重新拉起一次下载：${result.fileName} —— 请点浏览器右上角的下载按钮，或前往「下载」文件夹查看。`,
-        })
-      }
-    } finally {
-      setLocating(false)
-    }
   }
 
   /* ==================== 运行中：整页只留进度 ==================== */
@@ -429,13 +406,17 @@ export default function ExportPanel({ tables, reloadTables }: Props) {
             </Notice>
           ))}
           {result.errors.length > 0 && <div className="log">{result.errors.slice(0, 50).join('\n')}</div>}
-          {revealMsg && <Notice kind={revealMsg.kind}>{revealMsg.text}</Notice>}
 
-          <div style={{ textAlign: 'center', marginTop: 12 }}>
-            <button className="btn link" onClick={() => void doReveal()} disabled={locating}>
-              {locating ? '正在定位…' : '打开文件所在位置'}
-            </button>
-          </div>
+          {/*
+            * 不再提供「打开文件所在位置」。
+            *
+            * 插件跑在受沙箱限制的 iframe 里，没有文件系统权限 ——
+            * 点它只会触发一次重新下载，再弹一段"无法打开文件夹"的解释，
+            * 反而让用户以为出了错。直接说明文件在哪就行。
+            */}
+          <Notice kind="ok">
+            文件已保存到浏览器的默认下载位置（通常是「下载」文件夹）：{result.fileName}
+          </Notice>
         </CompletionCard>
       </div>
     )

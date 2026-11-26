@@ -354,14 +354,27 @@ export async function addRecords(
   return { written }
 }
 
-export async function fetchAllRecords(table: AnyTable): Promise<any[]> {
+/**
+ * 拉取记录。
+ *
+ * @param viewId 传了就按**该视图**的顺序返回（含视图里配置的筛选与排序）。
+ *
+ * ⚠️ 不传 viewId 时拿到的是「整表记录」，其顺序**未必等于用户在界面上看到的顺序** ——
+ * 视图有自己的排序规则，所以「第 1 行」可能对应 records[2]。
+ * 需要「所见即所得的行号」时必须传用户当前视图的 id。
+ */
+export async function fetchAllRecords(table: AnyTable, viewId?: string): Promise<any[]> {
   const out: any[] = []
   const CHUNK = 200
   if (typeof table.getRecordsByPage === 'function') {
     let pageToken: string | undefined
     let guard = 0
     for (;;) {
-      const res = await table.getRecordsByPage({ pageSize: CHUNK, pageToken })
+      const res = await table.getRecordsByPage({
+        pageSize: CHUNK,
+        pageToken,
+        ...(viewId ? { viewId } : {}),
+      })
       out.push(...(res?.records ?? []))
       if (!res?.hasMore || guard++ > 1000) break
       pageToken = res.pageToken
@@ -372,13 +385,23 @@ export async function fetchAllRecords(table: AnyTable): Promise<any[]> {
     let pageToken: string | undefined
     let guard = 0
     for (;;) {
-      const res = await table.getRecords({ pageSize: CHUNK, pageToken })
+      const res = await table.getRecords({ pageSize: CHUNK, pageToken, ...(viewId ? { viewId } : {}) })
       out.push(...(res?.records ?? []))
       if (!res?.hasMore || guard++ > 1000) break
       pageToken = res.pageToken
     }
   }
   return out
+}
+
+/** 当前视图 id（取不到就返回 undefined，调用方退回整表顺序） */
+export async function getActiveViewId(table: AnyTable): Promise<string | undefined> {
+  try {
+    const v = await table.getActiveView?.()
+    return (v as { id?: string } | undefined)?.id
+  } catch {
+    return undefined
+  }
 }
 
 export async function getAttachmentUrls(table: AnyTable, tokens: string[], fieldId: string, recordId: string): Promise<string[]> {
