@@ -29,6 +29,11 @@ import { listFields } from '../lib/base-api'
 type Props = {
   tables: TableBrief[]
   reloadTables: () => Promise<void>
+  /**
+   * 预览/测试用：初始就选中这些表，好让「导出选项」卡片直接渲染出来。
+   * 真实宿主里不传 —— 由用户自己勾选。
+   */
+  defaultSelected?: string[]
 }
 
 type ImageMode = 'dispimg' | 'float'
@@ -56,8 +61,8 @@ const EXPORT_STAGES: ProgressStageDef[] = [
   { key: 'pack', label: '嵌入图片并生成 Excel' },
 ]
 
-export default function ExportPanel({ tables, reloadTables }: Props) {
-  const [selected, setSelected] = useState<Set<string>>(new Set())
+export default function ExportPanel({ tables, reloadTables, defaultSelected }: Props) {
+  const [selected, setSelected] = useState<Set<string>>(new Set(defaultSelected ?? []))
   /**
    * 「是否把图片嵌入单元格」不再单独给开关 —— 下面的「图片嵌入方式」
    * 本身已经表达了这件事，两个控件并列只会让人犹豫。
@@ -70,7 +75,7 @@ export default function ExportPanel({ tables, reloadTables }: Props) {
   const [attachmentNameColumn, setAttachmentNameColumn] = useState(false)
   /** '' = 原图原尺寸 */
   const [imageSize, setImageSize] = useState('')
-  const [maxImageMb, setMaxImageMb] = useState(10)
+  const [maxImageMb, setMaxImageMb] = useState(20)
 
   /*
    * 导出内容：excel（默认，导出数据表） / attachments（只导出附件文件，打包 zip）
@@ -555,7 +560,7 @@ export default function ExportPanel({ tables, reloadTables }: Props) {
                   className="input size-input"
                   inputMode="numeric"
                   value={maxImageMb}
-                  onChange={(e) => setMaxImageMb(Math.max(1, Number(e.target.value.replace(/\D/g, '')) || 10))}
+                  onChange={(e) => setMaxImageMb(Math.max(1, Number(e.target.value.replace(/\D/g, '')) || 20))}
                 />
                 <span className="muted">MB 的附件</span>
               </span>
@@ -643,7 +648,7 @@ export default function ExportPanel({ tables, reloadTables }: Props) {
                   className="input size-input"
                   inputMode="numeric"
                   value={maxImageMb}
-                  onChange={(e) => setMaxImageMb(Math.max(1, Number(e.target.value.replace(/\D/g, '')) || 10))}
+                  onChange={(e) => setMaxImageMb(Math.max(1, Number(e.target.value.replace(/\D/g, '')) || 20))}
                 />
                 <span className="muted">MB 的附件</span>
               </span>

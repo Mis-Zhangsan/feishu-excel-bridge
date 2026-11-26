@@ -476,7 +476,7 @@ async function main() {
    * 并且单独占一行，不再挤在标题行右侧。
    */
   ok(!!host.querySelector('.dest-row'), '导入方式单独成行 .dest-row')
-  ok(!!host.querySelector('.seg'), '有「新建 / 追加」胶囊切换 .seg')
+  ok(!!host.querySelector('.seg-pill'), '有「新建 / 追加」胶囊切换 .seg-pill')
   const segOn = host.querySelector('.seg-btn.on')?.textContent ?? ''
   ok(/新建/.test(segOn), '默认选中「新建」', { got: segOn })
   ok(!!host.querySelector('.dest-name'), '新建模式下右侧是表名输入框')

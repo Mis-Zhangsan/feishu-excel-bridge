@@ -201,7 +201,7 @@ export default function MappingEditor({ sheets, tables, onChange, onLoadFields }
                 既占宽度又要靠文字区分语义，右侧还被挤到边缘。
               */}
               <div className="dest-row">
-                <div className="seg" role="tablist" aria-label="导入方式">
+                <div className="seg-pill" role="tablist" aria-label="导入方式">
                   <button
                     type="button"
                     role="tab"

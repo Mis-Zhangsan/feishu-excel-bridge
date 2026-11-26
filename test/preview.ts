@@ -253,7 +253,7 @@ views.push(
     '⑤ 导出 · 配置',
     '数据表多选 + 行式导出选项 + 底部栏',
     panelShell(
-      body(createElement(ExportPanel, { tables, reloadTables: noop })),
+      body(createElement(ExportPanel, { tables, reloadTables: noop, defaultSelected: ['tbl1'] })),
     ),
     1000,
   ),
