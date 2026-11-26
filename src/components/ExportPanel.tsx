@@ -1,4 +1,4 @@
-import { useRef, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import {
   Card,
   CompletionCard,
@@ -91,6 +91,8 @@ export default function ExportPanel({ tables, reloadTables, defaultSelected }: P
   /** 供「标题字段」下拉用的字段列表（按需加载第一个选中的表） */
   const [titleFieldOptions, setTitleFieldOptions] = useState<FieldBrief[]>([])
   const [loadingFields, setLoadingFields] = useState(false)
+  /** 当前字段列表是给哪张表加载的（换表要重新拉） */
+  const [loadedForTable, setLoadedForTable] = useState('')
   const [busy, setBusy] = useState(false)
   const [phase, setPhase] = useState<Phase>('config')
   const [progress, setProgress] = useState<ExportProgress | null>(null)
@@ -148,24 +150,45 @@ export default function ExportPanel({ tables, reloadTables, defaultSelected }: P
   /**
    * 拉取「标题字段」候选列表。
    *
-   * 只在用户切到「按字段值命名」时才请求 —— 大多数导出根本用不到，
-   * 打开面板就拉一遍字段属于无谓开销。
-   * 用第一个选中的数据表：多表导出时各表字段可能不同，
-   * 但标题字段通常是共有的（姓名、编号之类）。
+   * 只在用户切到「按字段值命名」时才请求 —— 大多数导出根本用不到。
+   *
+   * ⚠️ 必须记住"这份列表是给哪张表加载的"。
+   * 早前用 `titleFieldOptions.length` 做一次性缓存，导致两个死角：
+   *   1. 换了数据表，下拉里还是上一张表的字段（选中的 id 在新表里不存在，
+   *      exporter 会静默退回"第一个文本字段"，用户以为选项没生效）
+   *   2. 没选表时切到「按字段值」→ firstId 为空直接 return，
+   *      之后选了表也不会再触发，下拉永远停在「先选择数据表」
    */
-  const ensureTitleFields = async () => {
-    if (titleFieldOptions.length || loadingFields) return
-    const firstId = [...selected][0]
+  const ensureTitleFields = async (force = false) => {
+    const firstId = [...selected][0] ?? ''
     if (!firstId) return
+    if (!force && loadedForTable === firstId && titleFieldOptions.length) return
     setLoadingFields(true)
     try {
-      setTitleFieldOptions(await listFields(firstId))
+      const list = await listFields(firstId)
+      setTitleFieldOptions(list)
+      setLoadedForTable(firstId)
+      // 换表了：之前选的字段 id 在新表里没有，清掉让用户重选
+      if (loadedForTable && loadedForTable !== firstId) setTitleFieldId('')
     } catch {
       setTitleFieldOptions([])
     } finally {
       setLoadingFields(false)
     }
   }
+
+  /*
+   * 切到「按字段值」或换了数据表时，按需拉一次字段列表。
+   * 用 effect 而不是只在 onChange 里触发 —— 否则"先切模式、后勾选数据表"
+   * 这个顺序下永远不会加载。
+   */
+  useEffect(() => {
+    if (contentMode !== 'attachments' || naming !== 'field') return
+    if (!selected.size) return
+    void ensureTitleFields()
+    // ensureTitleFields 每次渲染都会重建，不该进依赖
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [contentMode, naming, selected])
 
   const doExport = async () => {
     if (!selected.size) return
@@ -344,7 +367,15 @@ export default function ExportPanel({ tables, reloadTables, defaultSelected }: P
         </div>
 
         <div className="done-actions">
-          <button className="btn ghost" onClick={skipFailures}>
+          {/*
+            * 重试进行中必须禁用「跳过」。
+            *
+            * 否则：点「全部重试」后立刻点「跳过」→ resolveRef 放行、导出打包完成、
+            * phase 变成 done；随后在途的重试返回空列表又 `setPhase('running')` ——
+            * 面板就卡在只有一个转圈、「正在准备」、且**没有取消按钮**的页面，
+            * 只能切页签才能脱困。
+            */}
+          <button className="btn ghost" disabled={retrying.length > 0} onClick={skipFailures}>
             跳过，继续导出
           </button>
           <button className="btn primary" disabled={retrying.length > 0} onClick={() => void retryFailures()}>
@@ -365,7 +396,7 @@ export default function ExportPanel({ tables, reloadTables, defaultSelected }: P
           subtitle={result.fileName}
           stats={[
             { v: result.summary.length, k: '工作表' },
-            { v: totalImages, k: '嵌入图片' },
+            { v: totalImages, k: contentMode === 'attachments' ? '附件文件' : '嵌入图片' },
             { v: sizeMb, k: 'MB 文件' },
             { v: totalRecords, k: '行记录' },
           ]}
@@ -381,13 +412,19 @@ export default function ExportPanel({ tables, reloadTables, defaultSelected }: P
             </>
           }
           note={
-            result.fileCount > 1
-              ? `${result.fileCount} 个 Excel 已打包为 zip；图片以${
-                  imageMode === 'dispimg' ? ' WPS 嵌入' : '标准浮动'
-                }方式写入`
-              : imageMode === 'dispimg'
-                ? '图片以 WPS 嵌入方式写入，用 WPS 打开可见'
-                : '图片以标准浮动方式写入，Excel / WPS 都能显示'
+            /*
+             * 「仅导出附件」的产物是 zip，没有工作表也没有嵌入图片 ——
+             * 复用 Excel 的文案会让用户以为插件搞错了输出（拿到 zip 却看到"图片以 WPS 嵌入方式写入"）。
+             */
+            contentMode === 'attachments'
+              ? '附件已按「列名」分文件夹打包为 zip，原始文件名与扩展名均已保留'
+              : result.fileCount > 1
+                ? `${result.fileCount} 个 Excel 已打包为 zip；图片以${
+                    imageMode === 'dispimg' ? ' WPS 嵌入' : '标准浮动'
+                  }方式写入`
+                : imageMode === 'dispimg'
+                  ? '图片以 WPS 嵌入方式写入，用 WPS 打开可见'
+                  : '图片以标准浮动方式写入，Excel / WPS 都能显示'
           }
         >
           <div className="result-list" style={{ marginTop: 16 }}>

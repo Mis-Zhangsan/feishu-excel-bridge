@@ -1,4 +1,4 @@
-import { FT, extOf, findOptionId, mimeOfName } from './field-meta'
+import { FT, extOf, findOptionId, hasOption, mimeOfName } from './field-meta'
 import { formatDate, parseBool, parseDateMs, parseNumber, rawToText, splitMulti } from './infer'
 import type { CellRaw, MediaRef } from './types'
 
@@ -78,7 +78,15 @@ export function toBitableValue(type: number, raw: CellRaw, ctx: ConvertContext):
       if (!ctx.options) {
         return { ok: false, reason: '读不到该多选字段的选项，写入会丢失' }
       }
-      const missing = arr.filter((t) => !ctx.options!.has(t))
+      /*
+       * 判断"选项是否存在"必须走 hasOption（三级比对），
+       * 和单选分支保持一致。
+       *
+       * 早前这里直接 `ctx.options.has(t)` —— 只做精确匹配，
+       * 于是「， 挤不出」这种只差一个空格的值会被判成"没有这个选项"，
+       * 明明能写进去却报错跳过。单选那边修过，多选漏了。
+       */
+      const missing = arr.filter((t) => !hasOption(ctx.options as Map<string, string>, t))
       if (missing.length) {
         const first = missing[0]
         const brief = first.length > 30 ? `${first.slice(0, 30)}…` : first
@@ -87,7 +95,10 @@ export function toBitableValue(type: number, raw: CellRaw, ctx: ConvertContext):
           reason: `多选选项里没有「${brief}」${missing.length > 1 ? ` 等 ${missing.length} 个值` : ''}（写入会丢失）`,
         }
       }
-      return { ok: true, value: arr.map((t) => selectValue(t, ctx.options)!) }
+      const picked = arr
+        .map((t) => selectValue(t, ctx.options))
+        .filter((x): x is { id: string; text: string } => !!x)
+      return { ok: true, value: picked }
     }
 
     case FT.Phone:

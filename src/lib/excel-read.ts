@@ -191,9 +191,22 @@ async function readSheetDrawings(
       if (!fromBlock) continue
       const rowTxt = innerText(fromBlock, 'row')
       const colTxt = innerText(fromBlock, 'col')
+      /*
+       * ⚠️ 不能直接 `Number(rowTxt)`：缺失时 `innerText` 返回 null 或 ''，
+       * 而 `Number(null) === 0`、`Number('') === 0`，`isFinite(0)` 又是 true ——
+       * 于是坐标缺失的浮动图会被**挂到 A1**（第 0 行第 0 列），
+       * 表现为「图片莫名其妙跑到左上角/表头」，而且不会有任何提示。
+       */
+      if (rowTxt === null || colTxt === null || rowTxt === '' || colTxt === '') {
+        lost++
+        continue
+      }
       const row = Number(rowTxt)
       const col = Number(colTxt)
-      if (!Number.isFinite(row) || !Number.isFinite(col)) continue
+      if (!Number.isFinite(row) || !Number.isFinite(col) || row < 0 || col < 0) {
+        lost++
+        continue
+      }
 
       const pics = findAll(anchor, 'pic')
       for (const pic of pics) {

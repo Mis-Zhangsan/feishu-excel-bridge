@@ -160,7 +160,20 @@ export async function preAddOptions(
   await readOptionMap(table, fieldId, map, field)
   if (typeof field?.addOption !== 'function') return map
 
-  const wanted = values.slice(0, 200)
+  /*
+   * 上限 200：飞书的 addOptions 一次传太多会被拒，而且选项本身也有总量限制。
+   * 超出的部分**必须**留痕 —— 早前静默 slice，导致第 201 个之后的值
+   * 既没建选项、也不在调用方的 `notCreated` 检查里（那些值压根没传进来），
+   * 用户只看到尾部大量单元格为空却查不到原因。
+   */
+  const MAX_OPTIONS_PER_FIELD = 200
+  const wanted = values.slice(0, MAX_OPTIONS_PER_FIELD)
+  if (values.length > MAX_OPTIONS_PER_FIELD) {
+    console.warn(
+      `[excel-bridge] 字段 ${fieldId} 的候选选项有 ${values.length} 个，` +
+        `超过上限 ${MAX_OPTIONS_PER_FIELD}，只处理前 ${MAX_OPTIONS_PER_FIELD} 个。`,
+    )
+  }
   /*
    * 判断"是否已存在"统一走 hasOption（三级比对）。
    * 飞书本身**不做选项去重**，判错一次就会多出一个几乎一样的选项。

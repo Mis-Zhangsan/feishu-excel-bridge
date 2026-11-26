@@ -11,7 +11,7 @@ import {
   uploadFilesSerial,
 } from './base-api'
 import type { UploadFileTiming } from './base-api'
-import { rawToText } from './infer'
+import { rawToText, splitMulti } from './infer'
 import { cellKey } from './types'
 import type { FieldBrief, MediaRef, SourceColumn, SourceSheet, StageItem } from './types'
 import { mimeOfName } from './field-meta'
@@ -99,12 +99,20 @@ function findRowsForValues(
   sheet: SourceSheet,
   col: SourceColumn,
   values: string[],
+  type: number,
 ): { row: number; text: string }[] {
   const wanted = new Set(values)
   const out: { row: number; text: string }[] = []
   for (const r of dataRowIndexes(sheet)) {
-    const t = rawToText(sheet.matrix[r]?.[col.col] ?? null).trim()
-    if (t && wanted.has(t)) out.push({ row: r + 1, text: t })
+    const raw = sheet.matrix[r]?.[col.col] ?? null
+    const t = rawToText(raw).trim()
+    if (!t) continue
+    /*
+     * 多选的值是**拆分后的片段**（`A、B` 里的 `A`），拿整格原文比对必然匹配 0 行，
+     * 于是"哪几行有问题"会变成空串。这里按同样的规则拆开再比。
+     */
+    const parts = type === FT.SingleSelect ? [t] : splitMulti(raw)
+    if (parts.some((p) => wanted.has(p))) out.push({ row: r + 1, text: t })
   }
   return out
 }
@@ -127,8 +135,8 @@ function findUnsafeOptionValues(
     const raw = sheet.matrix[r]?.[col.col] ?? null
     const t = rawToText(raw).trim()
     if (!t) continue
-    const parts =
-      type === FT.SingleSelect ? [t] : t.split(/[,，;；、]/).map((x) => x.trim()).filter(Boolean)
+    // 拆分规则与 collectSelectValues / 写入时的 splitMulti 保持一致
+    const parts = type === FT.SingleSelect ? [t] : splitMulti(raw)
     for (const p of parts) {
       if (p && !isOptionNameSafe(p)) out.push({ row: r + 1, text: p })
     }
@@ -147,15 +155,27 @@ function describeBadOptions(bad: { row: number; text: string }[]): string {
 
 /**
  * 收集某一列在单选/多选场景下需要用到的全部选项文本 */
+/** 单列最多收集多少个候选选项（超过要提示，不能静默截断） */
+const MAX_COLLECTED_OPTIONS = 200
+
 function collectSelectValues(sheet: SourceSheet, col: SourceColumn, type: number): string[] {
   const distinct = new Set<string>()
   for (const r of dataRowIndexes(sheet)) {
     const raw = sheet.matrix[r]?.[col.col] ?? null
     const t = rawToText(raw).trim()
     if (!t) continue
+    /*
+     * ⚠️ 拆分规则必须和写入时（`splitMulti`）**完全一致**。
+     *
+     * 早前这里写的是 `/[,，;；|、\/]/` —— 多拆了 `/` 和 `|`。
+     * 于是 `TCP/IP` 只会被建成 `TCP`、`IP` 两个碎片选项，整串永远建不出来；
+     * 而写入时 `splitMulti` 不拆 `/`，查不到 `TCP/IP` → 整个单元格判失败变空。
+     * 顺带还在目标表里留下两个**垃圾选项**（飞书不去重、不会自动清理）。
+     */
     if (type === FT.SingleSelect) distinct.add(t)
-    else t.split(/[,，;；|、\/]/).forEach((x) => x.trim() && distinct.add(x.trim()))
-    if (distinct.size > 200) break
+    else splitMulti(raw).forEach((x) => distinct.add(x))
+    // 上限到顶后要提示用户，不能静默截断（后面的值既不建选项也不在告警里）
+    if (distinct.size >= MAX_COLLECTED_OPTIONS) break
   }
   return [...distinct]
 }
@@ -341,18 +361,48 @@ export async function runImport(sheets: SourceSheet[], opts: ImportOptions): Pro
     let tableId = ''
     let tableName = sheet.importTableName || sheet.name
     let createdTable = false
-    if (sheet.importMode === 'append' && sheet.importTableId) {
-      tableId = sheet.importTableId
-    } else {
-      const created = await ensureTable(sheet.importTableName || sheet.name, false)
-      tableId = created.tableId
-      createdTable = created.created
+    /*
+     * 建表 / 取表要单独兜住。
+     *
+     * 不兜的话（追加模式下目标表被删、无权限，或新建表失败），异常会直接冒泡出
+     * runImport —— 界面只剩「导入失败」，前面已经写进别的表的记录数、
+     * 以及「已成功写入 N 条，请勿重复导入」这条关键提示全部丢失。
+     * 用户很可能直接再点一次，产生重复数据。
+     */
+    try {
+      if (sheet.importMode === 'append' && sheet.importTableId) {
+        tableId = sheet.importTableId
+      } else {
+        const created = await ensureTable(sheet.importTableName || sheet.name, false)
+        tableId = created.tableId
+        createdTable = created.created
+      }
+    } catch (e) {
+      errors.push({
+        sheet: sheet.name,
+        row: -1,
+        column: '—',
+        message: `创建/打开目标数据表失败：${String((e as Error)?.message ?? e)}。已跳过该工作表。`,
+      })
+      continue
     }
-    const table = await getTable(tableId)
+
+    let table: Awaited<ReturnType<typeof getTable>>
+    try {
+      table = await getTable(tableId)
+    } catch (e) {
+      errors.push({
+        sheet: sheet.name,
+        row: -1,
+        column: '—',
+        message: `读取目标数据表失败：${String((e as Error)?.message ?? e)}。已跳过该工作表。`,
+      })
+      continue
+    }
     try {
       tableName = (await table.getName()) || tableName
     } catch {
-      /* 忽略 */
+      /* 取名字失败不影响导入，用兜底名 */
     }
 
     /*
@@ -481,7 +531,7 @@ export async function runImport(sheets: SourceSheet[], opts: ImportOptions): Pro
               // 事后检查：哪些**真的**没建成
               const notCreated = vals.filter((v) => !hasOption(created, v))
               if (notCreated.length > 0) {
-                const rows = findRowsForValues(sheet, col, notCreated)
+                const rows = findRowsForValues(sheet, col, notCreated, meta.type)
                 warnings.push(
                   `「${sheet.name}」的字段「${col.header}」有 ${notCreated.length} 个值没能建成${fieldTypeLabel(meta.type)}选项：` +
                     `${describeBadOptions(rows)}。这些单元格会为空。`,
@@ -530,7 +580,7 @@ export async function runImport(sheets: SourceSheet[], opts: ImportOptions): Pro
             map = created
             const notCreated = vals.filter((v) => !hasOption(created, v))
             if (notCreated.length > 0) {
-              const rows = findRowsForValues(sheet, col, notCreated)
+              const rows = findRowsForValues(sheet, col, notCreated, sameName.type)
               warnings.push(
                 `「${sheet.name}」的字段「${col.header}」有 ${notCreated.length} 个值没能建成${fieldTypeLabel(sameName.type)}选项：` +
                   `${describeBadOptions(rows)}。这些单元格会为空。`,
@@ -633,7 +683,7 @@ export async function runImport(sheets: SourceSheet[], opts: ImportOptions): Pro
           // 事后检查：新建字段也可能有个别值建不成选项
           const notCreated = vals.filter((v) => !hasOption(map, v))
           if (notCreated.length > 0) {
-            const rows = findRowsForValues(sheet, col, notCreated)
+            const rows = findRowsForValues(sheet, col, notCreated, effectiveType)
             warnings.push(
               `「${sheet.name}」的字段「${col.header}」有 ${notCreated.length} 个值没能建成${fieldTypeLabel(effectiveType)}选项：` +
                 `${describeBadOptions(rows)}。这些单元格会为空；建议把该字段改成「多行文本」后重新导入。`,

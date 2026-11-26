@@ -215,8 +215,19 @@ export async function runAttachmentExport(opts: AttachmentExportOptions): Promis
   let skippedBig = 0
 
   /** 先收集所有待下载的附件（含已分配好的 zip 内路径） */
-  type DlTask = { url: string; path: string; label: string; size: number }
+  type DlTask = {
+    url: string
+    path: string
+    label: string
+    size: number
+    /** 所属表名 —— 下载是集中并发的，统计要能按表归位 */
+    tableName: string
+  }
   const dlTasks: DlTask[] = []
+  /** 每张表实际写进 zip 的附件数（下载完成后才准） */
+  const filesByTable = new Map<string, number>()
+  /** 表名 -> 记录数，供 summary 使用 */
+  const recordsByTable = new Map<string, number>()
 
   for (let ti = 0; ti < tableIds.length; ti++) {
     const table = await getTable(tableIds[ti])
@@ -278,7 +289,6 @@ export async function runAttachmentExport(opts: AttachmentExportOptions): Promis
       `${tableName} · 共 ${records.length} 条记录`,
     )
 
-    let tableFiles = 0
 
     for (let ri = 0; ri < records.length; ri++) {
       const rec = records[ri] as Record<string, unknown>
@@ -356,6 +366,7 @@ export async function runAttachmentExport(opts: AttachmentExportOptions): Promis
             path: fullPath,
             label: `「${field.name}」第 ${ri + 1} 行 · ${a.name || a.token}`,
             size: a.size || 0,
+            tableName,
           })
         }
       }
@@ -370,13 +381,17 @@ export async function runAttachmentExport(opts: AttachmentExportOptions): Promis
         )
     }
 
-    summary.push({ table: tableName, records: records.length, images: tableFiles })
+    /*
+     * summary 要等下载完才有准确数字 —— 这段时间只记下"这表处理了多少条记录"。
+     * `tableFiles` 早前从没自增过，导致完成页永远显示 0 个附件。
+     */
+    recordsByTable.set(tableName, records.length)
     report(
       'fetch',
       `读取 ${ti + 1}/${tableIds.length}`,
       records.length,
       records.length,
-      `${tableName} · 完成 ${tableFiles} 个附件`,
+      `${tableName} · 已收集 ${records.length} 条记录`,
     )
   }
 
@@ -411,6 +426,7 @@ export async function runAttachmentExport(opts: AttachmentExportOptions): Promis
         zip.file(t.path, buf)
         totalBytes += buf.byteLength
         totalFiles++
+        filesByTable.set(t.tableName, (filesByTable.get(t.tableName) ?? 0) + 1)
         if (items[i]) items[i].state = 'done'
       } catch (e) {
         if (items[i]) items[i].state = 'fail'
@@ -423,8 +439,23 @@ export async function runAttachmentExport(opts: AttachmentExportOptions): Promis
     })
   }
 
+  /*
+   * 全失败时不要把真实原因吞掉。
+   *
+   * 早前一律抛「没有找到可导出的附件…」，用户会去反复检查数据，
+   * 而真正的原因是下载链接失效/网络挂了 —— 那些信息本来就在 errors 里。
+   */
   if (!totalFiles) {
+    if (dlTasks.length) {
+      const first = errors[0] ? ` 首个错误：${errors[0]}` : ''
+      throw new Error(`找到了 ${dlTasks.length} 个附件，但全部下载失败。${first}`)
+    }
     throw new Error('没有找到可导出的附件。请确认所选数据表里有附件字段，且字段里有文件。')
+  }
+
+  // 下载完成，按表汇总（数字此时才准确）
+  for (const [name, count] of recordsByTable) {
+    summary.push({ table: name, records: count, images: filesByTable.get(name) ?? 0 })
   }
 
   report('pack', '正在打包 ZIP', 0, 1, `共 ${totalFiles} 个附件（${fmtSize(totalBytes)}）`)

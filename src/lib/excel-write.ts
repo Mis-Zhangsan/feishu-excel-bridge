@@ -480,6 +480,14 @@ export async function buildXlsxBytes(sheets: OutSheet[], opts: WriteOptions): Pr
   // 2) 定位每个 sheet 对应的 xml 文件
   const wbXml = (await readZipString(zip, 'xl/workbook.xml')) ?? ''
   const wbRelsXml = (await readZipString(zip, 'xl/_rels/workbook.xml.rels')) ?? ''
+  /*
+   * 没有关系表就定位不到工作表、也登记不了图片关系 —— 后面 insertBeforeClosing
+   * 在空串上找不到闭合标签会**原样返回**，于是空串被写回去、整包关系被清空，
+   * 最终产出一个 Excel 打不开的坏文件。这里明确失败，而不是静默降级。
+   */
+  if (!wbRelsXml) {
+    throw new Error('模板文件缺少 xl/_rels/workbook.xml.rels，无法定位工作表或登记图片关系。')
+  }
   const wbRels = parseRelationships(wbRelsXml)
   const ridToTarget = new Map(wbRels.map((r) => [r.id, r.target]))
   const nameToSheetPath = new Map<string, string>()
@@ -589,9 +597,15 @@ export async function buildXlsxBytes(sheets: OutSheet[], opts: WriteOptions): Pr
   // 3) Content Types
   const ctPath = '[Content_Types].xml'
   const ctXml = await readZipString(zip, ctPath)
-  if (ctXml) {
-    zip.file(ctPath, patchContentTypes(ctXml, imageExts, contentOverrides))
+  /*
+   * 缺这个部件就一定产不出能打开的 xlsx（Excel 会报"文件已损坏"）。
+   * 以前是 `if (ctXml)` 静默跳过，用户拿到坏文件却不知道原因；
+   * 宁可在这里明确失败，也不要交出打不开的东西。
+   */
+  if (!ctXml) {
+    throw new Error('模板文件缺少 [Content_Types].xml，无法生成有效的 xlsx。请重试，若持续出现请联系开发者。')
   }
+  zip.file(ctPath, patchContentTypes(ctXml, imageExts, contentOverrides))
 
   // 4) 强制打开时重算公式，DISPIMG 才会立刻渲染出图片
   const wbEntry = zip.file('xl/workbook.xml')
