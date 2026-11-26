@@ -103,6 +103,22 @@ export default function ImportPanel({ tables, reloadTables }: Props) {
   const lastFile = useRef<File | null>(null)
   /** 置 true 后导入器在下一个检查点退出（已写入的部分不回滚） */
   const stopRef = useRef(false)
+
+  /*
+   * 组件卸载（切到「导出为 Excel」标签 / 关面板）时**中断导入**。
+   *
+   * 不中断的话：组件已经卸载了，runImport 还在继续往飞书写记录，
+   * 完成后 setResult 落空；用户切回来看到的是全新的 config 页，
+   * 会以为导入失败又点一次 —— 于是同一批数据写了两遍。
+   * 重复数据比"被中断"严重得多，所以这里选择中断。
+   *
+   * 代价是"切一下页签就断"，因此在运行页明确写了「请勿切换标签页」。
+   */
+  useEffect(() => {
+    return () => {
+      stopRef.current = true
+    }
+  }, [])
   /**
    * 运行页的秒表。
    * 附件是串行上传的，几十 MB 的文件会让进度停在同一处好几分钟 ——
@@ -323,6 +339,7 @@ export default function ImportPanel({ tables, reloadTables }: Props) {
             已用 {formatDurationShort(elapsed)}
             {waiting >= 8 ? ` · 本步 ${formatDurationShort(waiting)}` : ''}
             {waiting >= 60 ? ' · 较慢' : ''}
+            <span className="muted">（导入中请勿切换标签页，会中断）</span>
           </span>
           <span className="footer-actions">
             <button
@@ -364,7 +381,12 @@ export default function ImportPanel({ tables, reloadTables }: Props) {
              */
             { v: result.tables.reduce((n, t) => n + t.records, 0), k: '已写入' },
             {
-              v: (result.uploadTimings ?? []).filter((t) => !!t).length,
+              /*
+               * 只数**成功**上传的附件。
+               * timings 里失败项和被熔断跳过的项也会写入（ok=false），
+               * 全算进去会让「附件图片 N」变成"尝试数"，和下面只列 ok 的耗时榜对不上。
+               */
+              v: (result.uploadTimings ?? []).filter((t) => t?.ok).length,
               k: '附件图片',
             },
           ]}

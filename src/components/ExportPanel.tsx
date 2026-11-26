@@ -293,6 +293,32 @@ export default function ExportPanel({ tables, reloadTables, defaultSelected }: P
     setPhase('running')
   }
 
+  /** 放弃这次导出：让 runExport 走 abort 分支，不产出文件 */
+  const abortExport = () => {
+    resolveRef.current?.('abort')
+    resolveRef.current = null
+    setMediaReview(null)
+    setProgress(null)
+    setPhase('config')
+  }
+
+  /*
+   * 组件卸载时把挂起的 review Promise 放行掉（abort）。
+   *
+   * 不清理的后果：导出停在 review 页时切到「导入 Excel」标签，ExportPanel 被卸载，
+   * runExport 永远 await 在那个 Promise 上不返回 —— 闭包持续持有
+   * 已下载的全部图片字节无法回收；切回来是全新挂载的 config 页，
+   * 既看不到这次导出也取消不了，用户再点导出就会同时跑两份，内存翻倍。
+   *
+   * 注意：卸载后不要再 setState（React 会警告），所以这里只 reject。
+   */
+  useEffect(() => {
+    return () => {
+      resolveRef.current?.('abort')
+      resolveRef.current = null
+    }
+  }, [])
+
   /* ==================== 运行中：整页只留进度 ==================== */
   if (phase === 'running') {
     return (
@@ -377,6 +403,10 @@ export default function ExportPanel({ tables, reloadTables, defaultSelected }: P
             */}
           <button className="btn ghost" disabled={retrying.length > 0} onClick={skipFailures}>
             跳过，继续导出
+          </button>
+          {/* 放弃也要有个出口 —— 否则用户只能关页签，反而触发悬空 Promise */}
+          <button className="btn ghost" disabled={retrying.length > 0} onClick={abortExport}>
+            放弃
           </button>
           <button className="btn primary" disabled={retrying.length > 0} onClick={() => void retryFailures()}>
             {retrying.length > 0 ? '重试中…' : `全部重试（${failCount}）`}

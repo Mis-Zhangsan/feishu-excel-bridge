@@ -213,6 +213,8 @@ export async function runAttachmentExport(opts: AttachmentExportOptions): Promis
   let totalFiles = 0
   let totalBytes = 0
   let skippedBig = 0
+  /** 内存预警只提示一次 */
+  let memoryWarned = false
 
   /** 先收集所有待下载的附件（含已分配好的 zip 内路径） */
   type DlTask = {
@@ -436,6 +438,23 @@ export async function runAttachmentExport(opts: AttachmentExportOptions): Promis
       if (done % 5 === 0 || done === dlTasks.length) {
         report('media', '下载附件', done, dlTasks.length, undefined, items)
       }
+      /*
+       * 内存预警。
+       *
+       * JSZip 是"全量攒在内存再打包"的模型，`generateAsync` 时还会再复制一份，
+       * 峰值大约是附件总量的 2 倍。几百 MB 的导出会直接把标签页打崩，
+       * 而且 OOM 崩掉时是白屏、没有任何提示。
+       *
+       * 超过 250 MB 就提醒用户分批导 —— 这是能做的最实际的保护
+       * （真正的解需要流式 zip，当前库不支持）。
+       */
+      if (totalBytes > 250 * 1024 * 1024 && !memoryWarned) {
+        memoryWarned = true
+        warnings.push(
+          `本次已累计 ${fmtSize(totalBytes)}，浏览器需要约 ${fmtSize(totalBytes * 2)} 内存才能打包完成。` +
+            `如果页面卡死或崩溃，请分表、分批导出。`,
+        )
+      }
     })
   }
 
@@ -611,7 +630,18 @@ export async function runExport(opts: ExportOptions): Promise<ExportResult> {
             row.push(null)
             return
           }
-          if (!isImageMime(a.type) || (a.size && a.size / 1024 / 1024 > opts.maxImageMb)) {
+          /*
+           * 大小上限：**0 表示不限制**。
+           *
+           * 早前这里写的是 `a.size && … > opts.maxImageMb`，0 会变成
+           * "任何非空文件都超限"（全部降级成文件名），
+           * 而附件模式是"0 = 不限制" —— 同一个参数两套语义。
+           * UI 用 Math.max(1, …) 挡住了 0，但测试/批量调用传 0 就会踩到。
+           */
+          if (
+            !isImageMime(a.type) ||
+            (opts.maxImageMb > 0 && !!a.size && a.size / 1024 / 1024 > opts.maxImageMb)
+          ) {
             // 非图片 / 超限：降级成文件名，至少信息不丢
             row.push(a.name)
             return

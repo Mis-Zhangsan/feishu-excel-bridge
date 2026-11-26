@@ -153,12 +153,29 @@ export async function preAddOptions(
   try {
     field = await table.getField(fieldId)
   } catch {
-    return await readOptionMap(table, fieldId, map, field)
+    // 连字段都取不到：不要往下走（否则会把所有值当缺失，整批重建成重复选项）
+    return map
   }
 
-  // 先拿到已有选项（这一步同时填好 map）
-  await readOptionMap(table, fieldId, map, field)
-  if (typeof field?.addOption !== 'function') return map
+  /*
+   * 先读已有选项（这一步同时填好 map）。
+   *
+   * **strict 模式**：读失败必须中止。
+   * 把"读失败"当成"表里没有选项"，会把所有值判成 missing 整批重建 ——
+   * 飞书不去重，一次网络抖动就能在下拉里堆出上百个同名选项。
+   * 这次宁可不补选项（调用方会报"选项未建成"），也不能重复建。
+   */
+  try {
+    await readOptionMap(table, fieldId, map, field, true)
+  } catch (e) {
+    console.warn(
+      `[excel-bridge] 读取字段 ${fieldId} 的选项失败，本次不补建选项（避免重复）：${String(
+        (e as Error)?.message ?? e,
+      )}`,
+    )
+    return map
+  }
+  if (typeof field?.addOption !== 'function' && typeof field?.addOptions !== 'function') return map
 
   /*
    * 上限 200：飞书的 addOptions 一次传太多会被拒，而且选项本身也有总量限制。
@@ -276,6 +293,14 @@ export async function readOptionMap(
   into?: Map<string, string>,
   /** 已经拿到的 field 对象；传了就省掉一次 getField（调用方常常刚拿过） */
   fieldObj?: unknown,
+  /**
+   * true = 读取失败时**抛出**而不是静默返回空 map。
+   *
+   * 「补建选项」这条路径必须用 strict：把"读失败"当成"表里没有选项"，
+   * 就会把所有值判成缺失、整批重新建一遍 —— 飞书不去重，
+   * 下拉里立刻多出整套重复选项。宁可这次不补，也不能重复建。
+   */
+  strict = false,
 ): Promise<Map<string, string>> {
   const map = into ?? new Map<string, string>()
   try {
@@ -318,8 +343,9 @@ export async function readOptionMap(
         )
       }
     }
-  } catch {
-    /* 忽略 */
+  } catch (e) {
+    if (strict) throw e
+    /* 非 strict：忽略（读不到选项不影响"写文本"，但调用方不该据此判断"没有选项"） */
   }
   return map
 }
@@ -610,7 +636,18 @@ export function uploadFilesSerial(
           if (list[k]) tokens[i + k] = list[k]
         })
       } catch {
-        // 整批失败（含超时）：不在这里记失败，交给下面的逐个兜底去定位具体文件
+        /*
+         * 整批失败（含超时）。
+         *
+         * ⚠️ `withTimeout` 只是 reject，底层的 `batchUploadFile` **还在飞** ——
+         * 而该接口明确禁止并发调用。如果立刻开始逐个兜底，就等于两个上传同时在跑，
+         * 触发限流后整批连续失败，正好是熔断逻辑想避免的后果。
+         *
+         * 这里先等一小会儿让在途请求有机会结束（按批大小给 1.5–8 秒）。
+         * 这只是缓解，不是根治 —— 真正的修复需要 SDK 支持 AbortSignal，
+         * 目前 `batchUploadFile` 没有这个参数。
+         */
+        await sleep(Math.min(8000, 1500 + Math.round(batchMb * 400)))
       }
 
       const batchMs = Date.now() - batchStart
