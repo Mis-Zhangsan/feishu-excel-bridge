@@ -2,6 +2,9 @@ import JSZip from 'jszip'
 import { FT, isImageMime } from './field-meta'
 import { fetchAllRecords, getAttachmentUrls, getTable, orderedFields, withTimeout } from './base-api'
 import { bitableValueToExcel, extractAttachments, guessExtFromMime } from './value-convert'
+import { formatDate } from './infer'
+import { buildAttachmentStem, cellToPlainText, dedupePath, pickExtension, sanitizeName } from './filename'
+
 import { buildXlsxBlob } from './excel-write'
 import type { OutCellImage, OutImage, OutSheet } from './excel-write'
 import type { FieldBrief, StageItem } from './types'
@@ -47,6 +50,14 @@ export type ExportMediaSession = {
   retry: (ids?: string[]) => Promise<MediaFailure[]>
 }
 
+/**
+ * 附件导出的命名方式。
+ *
+ * - `row`   按行号：`0001-1.jpg`、`0001-2.png`（行号统一四位，同行同列多图用 -1/-2 续号）
+ * - `field` 按字段值：用户指定一列作为标题，`张三-1.jpg`、`张三-2.png`
+ */
+export type AttachmentNamingMode = 'row' | 'field'
+
 export type ExportOptions = {
   tableIds: string[]
   /** dispimg = WPS 内嵌单元格；float = 浮动图片锚定到单元格 */
@@ -84,6 +95,18 @@ export type ExportOptions = {
    * 全部成功时不会调用这个钩子。
    */
   onMediaReady?: (session: ExportMediaSession) => Promise<'continue' | 'abort'>
+  onProgress?: (p: ExportProgress) => void
+}
+
+/** 仅导出附件时的专用选项 */
+export type AttachmentExportOptions = {
+  tableIds: string[]
+  /** 按行号 还是 按某个字段的值 */
+  naming: AttachmentNamingMode
+  /** naming === 'field' 时，用哪一列作为标题 */
+  titleFieldId?: string
+  /** 超过该大小的附件不下载（MB） */
+  maxImageMb: number
   onProgress?: (p: ExportProgress) => void
 }
 
@@ -159,6 +182,225 @@ function downloadName(name: string, ext: string): string {
   const base = (name || 'image').replace(/[\\/:*?"<>|]/g, '_').slice(0, 120)
   if (/\.[A-Za-z0-9]{2,5}$/.test(base)) return base
   return `${base}.${ext}`
+}
+
+/* ------------------------------------------------------------------ */
+/* 仅导出附件                                                          */
+/* ------------------------------------------------------------------ */
+
+export async function runAttachmentExport(opts: AttachmentExportOptions): Promise<ExportResult> {
+  const warnings: string[] = []
+  const errors: string[] = []
+  const summary: ExportResult['summary'] = []
+  const report = (
+    stage: ExportStage,
+    phase: string,
+    done: number,
+    total: number,
+    detail?: string,
+  ) => opts.onProgress?.({ stage, phase, done, total, detail })
+
+  const tableIds = opts.tableIds.filter(Boolean)
+  if (!tableIds.length) throw new Error('请至少选择一个数据表')
+
+  const zip = new JSZip()
+  /** 已写入 zip 的完整路径，用于防重名覆盖 */
+  const usedPaths = new Set<string>()
+  /** 多表时每个表加一层目录，避免不同表的同名文件夹混在一起 */
+  const multiTable = tableIds.length > 1
+
+  let totalFiles = 0
+  let totalBytes = 0
+  let skippedBig = 0
+
+  for (let ti = 0; ti < tableIds.length; ti++) {
+    const table = await getTable(tableIds[ti])
+    let tableName = `数据表${ti + 1}`
+    try {
+      tableName = (await table.getName()) || tableName
+    } catch {
+      /* ignore */
+    }
+    report('read', `读取 ${ti + 1}/${tableIds.length}`, ti, tableIds.length, tableName)
+
+    const fields = await orderedFields(table)
+    const records = await fetchAllRecords(table)
+
+    // 只关心附件字段
+    const attachFields = fields.filter((f) => f.type === FT.Attachment)
+    if (!attachFields.length) {
+      warnings.push(`「${tableName}」没有附件字段，已跳过。`)
+      summary.push({ table: tableName, records: 0, images: 0 })
+      continue
+    }
+
+    // 标题字段：naming === 'field' 时必须给，且要验证存在
+    let titleFieldId = opts.titleFieldId ?? ''
+    if (opts.naming === 'field') {
+      if (!titleFieldId || !fields.some((f) => f.id === titleFieldId)) {
+        // 用户没选或选错了：退回第一张文本类字段，再不行就用行号
+        const fallback = fields.find((f) => f.type === FT.Text || f.type === FT.Phone)
+        if (fallback) {
+          titleFieldId = fallback.id
+          warnings.push(`未指定标题字段，已自动改用「${fallback.name}」。`)
+        } else {
+          warnings.push(`未找到可用的标题字段，本次按行号命名。`)
+        }
+      }
+    }
+
+    /** 每个标题已用到第几号（field 模式）—— 跨行递增，避免「张三-1」重复 */
+    const seqByTitle = new Map<string, number>()
+    /** 表名前缀 */
+    const tablePrefix = multiTable ? `${sanitizeName(tableName)}/` : ''
+
+    report(
+      'fetch',
+      `读取 ${ti + 1}/${tableIds.length}`,
+      0,
+      records.length,
+      `${tableName} · 共 ${records.length} 条记录`,
+    )
+
+    let tableFiles = 0
+
+    for (let ri = 0; ri < records.length; ri++) {
+      const rec = records[ri] as Record<string, unknown>
+      const vals = (rec.fields ?? {}) as Record<string, unknown>
+      const rowNo = String(ri + 1).padStart(4, '0')
+
+      // field 模式：先取这一行的标题
+      let title = ''
+      if (opts.naming === 'field' && titleFieldId) {
+        const rawTitle = cellToPlainText(vals[titleFieldId]).trim()
+        title = rawTitle ? sanitizeName(rawTitle) : ''
+      }
+
+      for (const field of attachFields) {
+        const atts = extractAttachments(vals[field.id])
+        if (!atts.length) continue
+
+        const folder = `${tablePrefix}${sanitizeName(field.name)}/`
+
+        /*
+         * 同一行同一列可能有多张 —— 一次拿到这一格的下载地址。
+         * `getAttachmentUrls` 返回的数组与传入的 tokens **同序**，
+         * 所以下面用 urls[ai] 对应 atts[ai]。
+         */
+        let urls: string[] = []
+        try {
+          urls = await getAttachmentUrls(
+            table,
+            atts.map((a) => a.token),
+            field.id,
+            rec.recordId as string,
+          )
+        } catch (e) {
+          errors.push(`「${tableName}」第 ${ri + 1} 行「${field.name}」取下载地址失败：${String((e as Error)?.message ?? e)}`)
+          continue
+        }
+
+        // 记下这一格开始前的计数：全失败时 totalFiles 不会变，据此判断
+        const beforeCell = totalFiles
+        for (let ai = 0; ai < atts.length; ai++) {
+          const a = atts[ai]
+          const mb = (a.size || 0) / 1024 / 1024
+          if (opts.maxImageMb > 0 && mb > opts.maxImageMb) {
+            skippedBig++
+            warnings.push(`「${a.name || a.token}」体积 ${mb.toFixed(1)} MB，超过上限已跳过。`)
+            continue
+          }
+
+          const url = urls[ai]
+          if (!url) {
+            errors.push(`「${field.name}」第 ${ri + 1} 行的「${a.name || a.token}」没有下载地址，已跳过。`)
+            continue
+          }
+
+          // ---- 生成文件名（规则集中在 filename.ts，便于单测）----
+          const stem = buildAttachmentStem({
+            naming: opts.naming,
+            rowNo,
+            title,
+            index: ai,
+            total: atts.length,
+            seqByTitle,
+          })
+          const ext = pickExtension(a.name, a.type || '')
+          const fullPath = dedupePath(`${folder}${stem}${ext}`, usedPaths)
+
+          try {
+            const resp = await withTimeout(
+              fetch(url, { signal: timeoutSignal(IMAGE_FETCH_TIMEOUT_MS) }),
+              IMAGE_FETCH_TIMEOUT_MS,
+              `${a.name || '附件'} 下载`,
+            )
+            if (!resp.ok) throw new Error(`HTTP ${resp.status}`)
+            const buf = await resp.arrayBuffer()
+            zip.file(fullPath, buf)
+            totalBytes += buf.byteLength
+            tableFiles++
+            totalFiles++
+          } catch (e) {
+            errors.push(`「${field.name}」第 ${ri + 1} 行的「${a.name || a.token}」下载失败：${String((e as Error)?.message ?? e)}`)
+          }
+        }
+
+        /*
+         * 这一格一个都没成功 → 明确提示。
+         * 判据用"计数没变"而不是"文件夹是否为空"：
+         * zip 里只有文件条目，空文件夹本来就不会存在，查它没有意义。
+         */
+        if (atts.length && totalFiles === beforeCell) {
+          warnings.push(
+            `「${tableName}」第 ${ri + 1} 行「${field.name}」有 ${atts.length} 个附件，但都没能导出。`,
+          )
+        }
+      }
+
+      if (ri % 20 === 0)
+        report(
+          'fetch',
+          `读取 ${ti + 1}/${tableIds.length}`,
+          ri,
+          records.length,
+          `${tableName} · ${ri + 1}/${records.length}`,
+        )
+    }
+
+    summary.push({ table: tableName, records: records.length, images: tableFiles })
+    report(
+      'fetch',
+      `读取 ${ti + 1}/${tableIds.length}`,
+      records.length,
+      records.length,
+      `${tableName} · 完成 ${tableFiles} 个附件`,
+    )
+  }
+
+  if (!totalFiles) {
+    throw new Error('没有找到可导出的附件。请确认所选数据表里有附件字段，且字段里有文件。')
+  }
+
+  report('pack', '正在打包 ZIP', 0, 1, `共 ${totalFiles} 个附件（${fmtSize(totalBytes)}）`)
+  const blob = await zip.generateAsync({
+    type: 'blob',
+    compression: 'STORE', // 附件多是图片/文档，已压缩过，再压收益低还慢
+  })
+  report('pack', '正在打包 ZIP', 1, 1, '完成')
+
+  if (skippedBig) {
+    warnings.push(`有 ${skippedBig} 个附件超过 ${opts.maxImageMb} MB 上限，未包含在压缩包里。`)
+  }
+
+  return {
+    blob,
+    fileName: `附件导出_${safeFileStamp()}.zip`,
+    summary,
+    warnings,
+    errors,
+    fileCount: 1,
+  }
 }
 
 export async function runExport(opts: ExportOptions): Promise<ExportResult> {

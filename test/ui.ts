@@ -149,8 +149,35 @@ async function main() {
   ok(/合并为一个 Excel/.test(html), '新增「合并为一个 Excel」选项')
   ok(/拆分多个 Excel/.test(html), '新增「拆分多个 Excel」选项')
   const optGroups = host.querySelectorAll('.opt-group').length
-  ok(optGroups === 2, '导出选项分「导出方式 / 图片嵌入方式」两组', { optGroups })
+  ok(optGroups === 3, '导出选项分「导出内容 / 导出方式 / 图片嵌入方式」三组', { optGroups })
   ok(!host.querySelector('.opt-group.disabled'), '选项组不再有整体禁用态（嵌图开关已移除）')
+
+  /* ---- 仅导出附件 ---- */
+  ok(/仅附件文件/.test(html), '有「仅附件文件」选项')
+  ok(/数据表 \+ 图片/.test(html), '默认仍是「数据表 + 图片」')
+  // 默认在 Excel 模式：应看到 Excel 专属选项，不该看到附件命名选项
+  ok(/图片嵌入方式/.test(html), 'Excel 模式下显示图片嵌入方式')
+  ok(!/附件命名/.test(html), 'Excel 模式下不显示附件命名')
+
+  /*
+   * 切到「仅附件文件」后：
+   * - 出现命名方式（按行号 / 按字段值）
+   * - 隐藏只对 Excel 有意义的选项，避免用户以为它们还生效
+   */
+  const attachBtn = [...host.querySelectorAll('.segmented button')].find((el) =>
+    /仅附件文件/.test(el.textContent ?? ''),
+  )
+  ok(!!attachBtn, '能找到「仅附件文件」切换按钮')
+  if (attachBtn) {
+    await act(async () => {
+      ;(attachBtn as HTMLElement).click()
+    })
+  }
+  const attachHtml = host.innerHTML
+  ok(/附件命名/.test(attachHtml), '仅附件模式下出现「附件命名」')
+  ok(/按行号/.test(attachHtml) && /按字段值/.test(attachHtml), '提供「按行号 / 按字段值」两种命名')
+  ok(!/图片嵌入方式/.test(attachHtml), '仅附件模式下隐藏「图片嵌入方式」')
+  ok(!/合并为一个 Excel/.test(attachHtml), '仅附件模式下隐藏打包方式')
 
   /* ============ 4. 步骤条（各阶段） ============ */
   console.log('\n=== 4. 步骤条各阶段 ===')

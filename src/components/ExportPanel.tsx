@@ -20,10 +20,11 @@ import {
   IconTable,
   IconWarn,
 } from './icons'
-import { buildExportLogLines, revealExportFile, runExport, triggerDownload } from '../lib/exporter'
+import { buildExportLogLines, revealExportFile, runAttachmentExport, runExport, triggerDownload } from '../lib/exporter'
 import { saveRunLog } from '../lib/diag-log'
-import type { ExportMediaSession, ExportProgress, ExportResult, MediaFailure } from '../lib/exporter'
-import type { TableBrief } from '../lib/types'
+import type { AttachmentNamingMode, ExportMediaSession, ExportProgress, ExportResult, MediaFailure } from '../lib/exporter'
+import type { FieldBrief, TableBrief } from '../lib/types'
+import { listFields } from '../lib/base-api'
 
 type Props = {
   tables: TableBrief[]
@@ -70,6 +71,21 @@ export default function ExportPanel({ tables, reloadTables }: Props) {
   /** '' = 原图原尺寸 */
   const [imageSize, setImageSize] = useState('')
   const [maxImageMb, setMaxImageMb] = useState(10)
+
+  /*
+   * 导出内容：excel（默认，导出数据表） / attachments（只导出附件文件，打包 zip）
+   *
+   * 「仅导出附件」是一个完全不同的产物：不出 Excel，按列建文件夹放原始文件。
+   * 所以它需要自己的一组选项（命名方式、标题字段），而 Excel 那套选项对它无意义。
+   */
+  const [contentMode, setContentMode] = useState<'excel' | 'attachments'>('excel')
+  /** 附件命名：按行号 / 按某个字段的值 */
+  const [naming, setNaming] = useState<AttachmentNamingMode>('row')
+  /** naming === 'field' 时用作标题的字段 id */
+  const [titleFieldId, setTitleFieldId] = useState('')
+  /** 供「标题字段」下拉用的字段列表（按需加载第一个选中的表） */
+  const [titleFieldOptions, setTitleFieldOptions] = useState<FieldBrief[]>([])
+  const [loadingFields, setLoadingFields] = useState(false)
   const [busy, setBusy] = useState(false)
   const [phase, setPhase] = useState<Phase>('config')
   const [progress, setProgress] = useState<ExportProgress | null>(null)
@@ -109,6 +125,13 @@ export default function ExportPanel({ tables, reloadTables }: Props) {
 
   /** 阶段清单：给「下载附件图片」挂上每张图的明细，可展开查看 */
   const stages: ProgressStageDef[] = EXPORT_STAGES.map((s) => {
+    // 仅导附件时最后一步是打包 zip，不是生成 Excel
+    if (s.key === 'pack') {
+      return {
+        ...s,
+        label: contentMode === 'attachments' ? '打包 ZIP' : s.label,
+      }
+    }
     if (s.key !== 'media') return s
     const onMedia = progress?.stage === 'media'
     return {
@@ -119,6 +142,28 @@ export default function ExportPanel({ tables, reloadTables }: Props) {
     }
   })
 
+  /**
+   * 拉取「标题字段」候选列表。
+   *
+   * 只在用户切到「按字段值命名」时才请求 —— 大多数导出根本用不到，
+   * 打开面板就拉一遍字段属于无谓开销。
+   * 用第一个选中的数据表：多表导出时各表字段可能不同，
+   * 但标题字段通常是共有的（姓名、编号之类）。
+   */
+  const ensureTitleFields = async () => {
+    if (titleFieldOptions.length || loadingFields) return
+    const firstId = [...selected][0]
+    if (!firstId) return
+    setLoadingFields(true)
+    try {
+      setTitleFieldOptions(await listFields(firstId))
+    } catch {
+      setTitleFieldOptions([])
+    } finally {
+      setLoadingFields(false)
+    }
+  }
+
   const doExport = async () => {
     if (!selected.size) return
     setBusy(true)
@@ -127,30 +172,47 @@ export default function ExportPanel({ tables, reloadTables }: Props) {
     setRevealMsg(null)
     setPhase('running')
     try {
-      const res = await runExport({
-        tableIds: [...selected],
-        imageMode,
-        embedImages,
-        packMode,
-        allImages,
-        attachmentNameColumn,
-        // 0 / 空 → 原图原尺寸
-        imageSizePx: parsedSize > 0 ? Math.min(2000, Math.max(16, parsedSize)) : undefined,
-        maxImageMb,
-        /**
-         * 有图片没下下来时**先不打包**，停在这一步让用户逐张重试或跳过。
-         * 否则用户只会看到「有 N 张失败」，却不知道该补哪几张。
-         * 这里返回一个挂起的 Promise，由界面上的按钮来放行。
-         */
-        onMediaReady: (session) => {
-          setMediaReview({ failures: session.failures, retry: session.retry })
-          setPhase('review')
-          return new Promise<'continue' | 'abort'>((resolve) => {
-            resolveRef.current = resolve
-          })
-        },
-        onProgress: (p) => setProgress(p),
-      })
+      /*
+       * 两条完全不同的产出路径：
+       * - excel：数据表 + 嵌入的图片，走 runExport
+       * - attachments：只把附件文件按列分文件夹打成 zip，走 runAttachmentExport
+       *
+       * 后者不传 Excel 那套选项 —— 它们对「只导附件」没有意义，
+       * 传进去只会让人误以为生效。
+       */
+      const res =
+        contentMode === 'attachments'
+          ? await runAttachmentExport({
+              tableIds: [...selected],
+              naming,
+              titleFieldId: naming === 'field' ? titleFieldId : undefined,
+              maxImageMb,
+              onProgress: (p) => setProgress(p),
+            })
+          : await runExport({
+              tableIds: [...selected],
+              imageMode,
+              embedImages,
+              packMode,
+              allImages,
+              attachmentNameColumn,
+              // 0 / 空 → 原图原尺寸
+              imageSizePx: parsedSize > 0 ? Math.min(2000, Math.max(16, parsedSize)) : undefined,
+              maxImageMb,
+              /**
+               * 有图片没下下来时**先不打包**，停在这一步让用户逐张重试或跳过。
+               * 否则用户只会看到「有 N 张失败」，却不知道该补哪几张。
+               * 这里返回一个挂起的 Promise，由界面上的按钮来放行。
+               */
+              onMediaReady: (session) => {
+                setMediaReview({ failures: session.failures, retry: session.retry })
+                setPhase('review')
+                return new Promise<'continue' | 'abort'>((resolve) => {
+                  resolveRef.current = resolve
+                })
+              },
+              onProgress: (p) => setProgress(p),
+            })
       setResult(res)
       triggerDownload(res.blob, res.fileName)
       // 记下这次运行 —— 用户去反馈时日志通常已经拿不到了
@@ -425,91 +487,188 @@ export default function ExportPanel({ tables, reloadTables }: Props) {
       </Card>
 
       <Card title="导出选项">
-        {/* 导出方式：合并成一个 Excel，还是按数据表拆成多个 */}
+        {/* 导出内容：数据表 / 只要附件文件 */}
         <div className="opt-group">
-          <div className="opt-label">导出方式</div>
-          <Segmented<PackMode>
-            value={packMode}
-            ariaLabel="导出方式"
+          <div className="opt-label">导出内容</div>
+          <Segmented<'excel' | 'attachments'>
+            value={contentMode}
+            ariaLabel="导出内容"
             options={[
-              { value: 'single', label: '合并为一个 Excel' },
-              { value: 'perTable', label: '拆分多个 Excel' },
+              { value: 'excel', label: '数据表 + 图片' },
+              { value: 'attachments', label: '仅附件文件' },
             ]}
-            onChange={setPackMode}
+            onChange={(v) => {
+              setContentMode(v)
+              if (v === 'attachments' && naming === 'field') void ensureTitleFields()
+            }}
           />
-          <div className="opt-note">{PACK_TIP[packMode]}</div>
+          <div className="opt-note">
+            {contentMode === 'excel'
+              ? '生成 Excel，图片按所选方式嵌入单元格。'
+              : '不生成 Excel。附件按「列名」分文件夹打包成 zip，保留原文件与扩展名。'}
+          </div>
         </div>
 
-        {/* 图片嵌入方式 */}
-        <div className="opt-group">
-          <div className="opt-label">图片嵌入方式</div>
-          <Segmented<ImageMode>
-            value={imageMode}
-            ariaLabel="图片嵌入方式"
-            options={[
-              { value: 'dispimg', label: 'WPS嵌入单元格图片', icon: <IconImage size={14} /> },
-              { value: 'float', label: '标准浮动图片', icon: <IconImage size={14} /> },
-            ]}
-            onChange={setImageMode}
-          />
-          <div className="opt-note">{MODE_TIP[imageMode]}</div>
-        </div>
+        {contentMode === 'attachments' ? (
+          <>
+            {/* 命名方式 */}
+            <div className="opt-group">
+              <div className="opt-label">附件命名</div>
+              <Segmented<AttachmentNamingMode>
+                value={naming}
+                ariaLabel="附件命名方式"
+                options={[
+                  { value: 'row', label: '按行号' },
+                  { value: 'field', label: '按字段值' },
+                ]}
+                onChange={(v) => {
+                  setNaming(v)
+                  if (v === 'field') void ensureTitleFields()
+                }}
+              />
+              <div className="opt-note">
+                {naming === 'row'
+                  ? '0001.jpg；同一行同一列有多张时为 0001-1.jpg、0001-2.jpg'
+                  : '张三-1.jpg、张三-2.jpg；下一行李四则从 李四-1.jpg 开始'}
+              </div>
+            </div>
 
-        {/* 图片尺寸 —— 两种嵌图方式都生效 */}
-        <div className="opt-row">
-          <span className="opt-name">图片边长</span>
-          <span className="opt-ctl">
-            <input
-              className="input size-input"
-              inputMode="numeric"
-              placeholder="原图"
-              value={imageSize}
-              onChange={(e) => setImageSize(e.target.value.replace(/\D/g, '').slice(0, 4))}
-            />
-            <span className="muted">px</span>
-            <Tip text="留空 = 原图原尺寸（推荐）。填数字 = 等比缩放到该边长，让表格更紧凑。两种嵌图方式都生效。">
-              <span className="help-dot">
-                <IconInfo size={12} />
+            {/* 标题字段（仅「按字段值」时需要） */}
+            {naming === 'field' && (
+              <div className="opt-row">
+                <span className="opt-name">标题字段</span>
+                <span className="opt-ctl">
+                  <select
+                    className="input"
+                    aria-label="标题字段"
+                    value={titleFieldId}
+                    onChange={(e) => setTitleFieldId(e.target.value)}
+                  >
+                    <option value="">
+                      {loadingFields
+                        ? '加载中…'
+                        : titleFieldOptions.length
+                          ? '请选择字段'
+                          : '先选择数据表'}
+                    </option>
+                    {titleFieldOptions.map((f) => (
+                      <option key={f.id} value={f.id}>
+                        {f.name}
+                      </option>
+                    ))}
+                  </select>
+                  <Tip text="用这一列的值作为文件名前缀。该行此列为空时，回退成行号。">
+                    <span className="help-dot">
+                      <IconInfo size={12} />
+                    </span>
+                  </Tip>
+                </span>
+              </div>
+            )}
+
+            {/* 大小上限（两种模式共用） */}
+            <div className="opt-row">
+              <span className="opt-name">跳过超过</span>
+              <span className="opt-ctl">
+                <input
+                  className="input size-input"
+                  inputMode="numeric"
+                  value={maxImageMb}
+                  onChange={(e) => setMaxImageMb(Math.max(1, Number(e.target.value.replace(/\D/g, '')) || 10))}
+                />
+                <span className="muted">MB 的附件</span>
               </span>
-            </Tip>
-          </span>
-        </div>
+            </div>
+          </>
+        ) : (
+          <>
+            {/* 导出方式：合并成一个 Excel，还是按数据表拆成多个 */}
+            <div className="opt-group">
+              <div className="opt-label">导出方式</div>
+              <Segmented<PackMode>
+                value={packMode}
+                ariaLabel="导出方式"
+                options={[
+                  { value: 'single', label: '合并为一个 Excel' },
+                  { value: 'perTable', label: '拆分多个 Excel' },
+                ]}
+                onChange={setPackMode}
+              />
+              <div className="opt-note">{PACK_TIP[packMode]}</div>
+            </div>
 
-        {/* 多图处理 */}
-        <div className="opt-row">
-          <label className="check">
-            <input type="checkbox" checked={allImages} onChange={(e) => setAllImages(e.target.checked)} />
-            <span>全部图片都导出</span>
-          </label>
-          <span className="opt-hint">{allImages ? '照片 / 照片2 / 照片3…' : '只嵌第一张'}</span>
-        </div>
+            {/* 图片嵌入方式 */}
+            <div className="opt-group">
+              <div className="opt-label">图片嵌入方式</div>
+              <Segmented<ImageMode>
+                value={imageMode}
+                ariaLabel="图片嵌入方式"
+                options={[
+                  { value: 'dispimg', label: 'WPS嵌入单元格图片', icon: <IconImage size={14} /> },
+                  { value: 'float', label: '标准浮动图片', icon: <IconImage size={14} /> },
+                ]}
+                onChange={setImageMode}
+              />
+              <div className="opt-note">{MODE_TIP[imageMode]}</div>
+            </div>
 
-        {/* 附件名列（默认不勾选） */}
-        <div className="opt-row">
-          <label className="check">
-            <input
-              type="checkbox"
-              checked={attachmentNameColumn}
-              onChange={(e) => setAttachmentNameColumn(e.target.checked)}
-            />
-            <span>额外输出「附件名」列</span>
-          </label>
-          <span className="opt-hint">纯文本文件名</span>
-        </div>
+            {/* 图片尺寸 —— 两种嵌图方式都生效 */}
+            <div className="opt-row">
+              <span className="opt-name">图片边长</span>
+              <span className="opt-ctl">
+                <input
+                  className="input size-input"
+                  inputMode="numeric"
+                  placeholder="原图"
+                  value={imageSize}
+                  onChange={(e) => setImageSize(e.target.value.replace(/\D/g, '').slice(0, 4))}
+                />
+                <span className="muted">px</span>
+                <Tip text="留空 = 原图原尺寸（推荐）。填数字 = 等比缩放到该边长，让表格更紧凑。两种嵌图方式都生效。">
+                  <span className="help-dot">
+                    <IconInfo size={12} />
+                  </span>
+                </Tip>
+              </span>
+            </div>
 
-        {/* 单个附件的大小上限 */}
-        <div className="opt-row">
-          <span className="opt-name">跳过超过</span>
-          <span className="opt-ctl">
-            <input
-              className="input size-input"
-              inputMode="numeric"
-              value={maxImageMb}
-              onChange={(e) => setMaxImageMb(Math.max(1, Number(e.target.value.replace(/\D/g, '')) || 10))}
-            />
-            <span className="muted">MB 的附件</span>
-          </span>
-        </div>
+            {/* 多图处理 */}
+            <div className="opt-row">
+              <label className="check">
+                <input type="checkbox" checked={allImages} onChange={(e) => setAllImages(e.target.checked)} />
+                <span>全部图片都导出</span>
+              </label>
+              <span className="opt-hint">{allImages ? '照片 / 照片2 / 照片3…' : '只嵌第一张'}</span>
+            </div>
+
+            {/* 附件名列（默认不勾选） */}
+            <div className="opt-row">
+              <label className="check">
+                <input
+                  type="checkbox"
+                  checked={attachmentNameColumn}
+                  onChange={(e) => setAttachmentNameColumn(e.target.checked)}
+                />
+                <span>额外输出「附件名」列</span>
+              </label>
+              <span className="opt-hint">纯文本文件名</span>
+            </div>
+
+            {/* 单个附件的大小上限 */}
+            <div className="opt-row">
+              <span className="opt-name">跳过超过</span>
+              <span className="opt-ctl">
+                <input
+                  className="input size-input"
+                  inputMode="numeric"
+                  value={maxImageMb}
+                  onChange={(e) => setMaxImageMb(Math.max(1, Number(e.target.value.replace(/\D/g, '')) || 10))}
+                />
+                <span className="muted">MB 的附件</span>
+              </span>
+            </div>
+          </>
+        )}
       </Card>
 
       {error && <Notice kind="err">{error}</Notice>}

@@ -11,6 +11,7 @@ import type { OutSheet } from '../src/lib/excel-write'
 import { parseWorkbookFile, extractDispImgId, isDateFormat } from '../src/lib/excel-read'
 import { excelSerialToMs, formatDate, parseNumber, splitMulti } from '../src/lib/infer'
 import { FT, OPTION_NAME_MAX_LEN, findOptionId, hasOption, isOptionNameSafe, looseOptionKey, normalizeOptionName } from '../src/lib/field-meta'
+import { buildAttachmentStem, cellToPlainText, dedupePath, pickExtension, sanitizeName } from '../src/lib/filename'
 import { cellKey } from '../src/lib/types'
 import { bitableValueToExcel, toBitableValue } from '../src/lib/value-convert'
 
@@ -586,6 +587,104 @@ function checkNumberAndSplit() {
   const caseMap = new Map<string, string>([['ABC', 'id_upper']])
   ok(hasOption(caseMap, 'abc') === false, 'hasOption 大小写敏感：ABC ≠ abc')
   ok(hasOption(caseMap, 'ABC') === true, '完全一致才算命中')
+
+  /* ---- 仅导出附件：文件名清洗与命名 ---- */
+  /*
+   * 文件名要跨 Windows / macOS / Linux 通用：Windows 禁用 \ / : * ? " < > |，
+   * 前导点会变隐藏文件，首尾空白容易被系统吞掉。
+   */
+  ok(sanitizeName('照片/2024:01*?') === '照片_2024_01__', '特殊字符替换为下划线', {
+    got: sanitizeName('照片/2024:01*?'),
+  })
+  ok(sanitizeName('   ') === '未命名', '全空白回退为「未命名」')
+  ok(sanitizeName('..hidden') === 'hidden', '去掉前导点（避免变隐藏文件）')
+  ok(sanitizeName('a  b') === 'a b', '压缩连续空格')
+  ok(sanitizeName('张三').length <= 80 && sanitizeName('x'.repeat(200)).length === 80, '超长截到 80')
+
+  /* 扩展名：优先用原文件名，其次用 MIME 猜，都没有就留空 */
+  ok(pickExtension('photo.JPG', 'image/jpeg') === '.jpg', '扩展名统一小写')
+  ok(pickExtension('没有扩展名', 'image/png') === '.png', '缺扩展名时用 MIME 推断')
+  ok(pickExtension('x', '') === '', '都拿不到时返回空串')
+  /*
+   * 关键：`guessExtFromMime` 不认时兜底返回 png，
+   * 对 PDF/Word 附件会产出「合同.png」这种错误结果。必须单独映射。
+   */
+  ok(pickExtension('合同', 'application/pdf') === '.pdf', 'PDF 附件得到 .pdf 而不是 .png')
+  ok(
+    pickExtension(
+      '月报',
+      'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    ) === '.xlsx',
+    'xlsx 附件正确识别',
+  )
+  ok(pickExtension('未知', 'application/x-weird') === '', '认不出的类型宁可留空，不瞎猜')
+
+  /* 去重：同名文件不覆盖，追加 (2) (3) */
+  const usedPaths = new Set<string>()
+  ok(dedupePath('照片/0001.jpg', usedPaths) === '照片/0001.jpg', '首次不冲突')
+  ok(dedupePath('照片/0001.jpg', usedPaths) === '照片/0001(2).jpg', '第二次冲突 → (2)')
+  ok(dedupePath('照片/0001.jpg', usedPaths) === '照片/0001(3).jpg', '第三次 → (3)')
+
+  /* 标题取值：飞书的字段值可能是对象/数组，不能直接 String() 否则全是 [object Object] */
+  ok(cellToPlainText({ id: 'x', text: '张三' }) === '张三', '单选对象取 text')
+  ok(
+    cellToPlainText([
+      { id: 'a', name: '李四' },
+      { id: 'b', name: '王五' },
+    ]) === '李四 王五',
+    '人员数组取 name 并用空格连接',
+  )
+  ok(cellToPlainText(null) === '', '空值返回空串')
+  ok(cellToPlainText('纯文本') === '纯文本', '字符串原样返回')
+
+  /* ---- 附件命名规则 ---- */
+  const seqRow = new Map<string, number>()
+  ok(
+    buildAttachmentStem({ naming: 'row', rowNo: '0001', title: '', index: 0, total: 1, seqByTitle: seqRow }) ===
+      '0001',
+    '按行号：单张时就是 0001',
+  )
+  ok(
+    buildAttachmentStem({ naming: 'row', rowNo: '0001', title: '', index: 0, total: 3, seqByTitle: seqRow }) ===
+      '0001-1',
+    '按行号：同行同列多张从 -1 开始',
+  )
+  ok(
+    buildAttachmentStem({ naming: 'row', rowNo: '0001', title: '', index: 2, total: 3, seqByTitle: seqRow }) ===
+      '0001-3',
+    '按行号：第 3 张是 0001-3',
+  )
+
+  const seqField = new Map<string, number>()
+  ok(
+    buildAttachmentStem({ naming: 'field', rowNo: '0001', title: '张三', index: 0, total: 2, seqByTitle: seqField }) ===
+      '张三-1',
+    '按字段值：张三-1',
+  )
+  ok(
+    buildAttachmentStem({ naming: 'field', rowNo: '0001', title: '张三', index: 1, total: 2, seqByTitle: seqField }) ===
+      '张三-2',
+    '按字段值：同行第 2 张是 张三-2',
+  )
+  /*
+   * 关键：下一行也叫「张三」时必须顺延成 张三-3，
+   * 否则两行都会产出 张三-1，后者覆盖前者。
+   */
+  ok(
+    buildAttachmentStem({ naming: 'field', rowNo: '0002', title: '张三', index: 0, total: 1, seqByTitle: seqField }) ===
+      '张三-3',
+    '按字段值：跨行同名继续递增，不撞名',
+  )
+  ok(
+    buildAttachmentStem({ naming: 'field', rowNo: '0003', title: '李四', index: 0, total: 1, seqByTitle: seqField }) ===
+      '李四-1',
+    '按字段值：换名字重新从 1 开始',
+  )
+  ok(
+    buildAttachmentStem({ naming: 'field', rowNo: '0004', title: '', index: 0, total: 1, seqByTitle: seqField }) ===
+      '0004',
+    '按字段值：标题为空时回退行号',
+  )
   const wsOpts = new Map<string, string>()
   wsOpts.set('泵头坏了，挤不出料体', 'opt_1')
   const wsHit = toBitableValue(FT.SingleSelect, '泵头坏了， 挤不出料体', {
